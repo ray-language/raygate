@@ -1,0 +1,92 @@
+// raygate — wiring: the request handler and the graceful server.
+import std/time;
+import net/webserver;
+import config;
+import control;
+import proxy;
+from net/log import logger, with_trace, info, warn, field, field_int, emit;
+
+pub struct Gate {
+    cfg: config.Config,
+    ctl: Channel<control.Ctl>,
+}
+
+pub fn make(cfg: config.Config) -> Gate {
+    Gate { cfg: cfg, ctl: control.start(cfg) }
+}
+
+pub fn handle(g: Gate, req: webserver.Request) -> webserver.Response {
+    let t = webserver.trace_of(req);
+    let lg = with_trace(logger("raygate"), t.trace_id);
+    if (req.path == g.cfg.server.metrics_path && g.cfg.server.metrics_path != "") {
+        var resp = webserver.text(200, control.scrape(g.ctl));
+        resp.headers.insert("Content-Type", "text/plain; version=0.0.4");
+        return resp;
+    }
+    if (req.path == g.cfg.server.health_path && g.cfg.server.health_path != "") {
+        return webserver.ok("ok\n");
+    }
+    match (config.match_route(g.cfg.routes, req.path)) {
+        Option.None => webserver.text(404, "no route\n"),
+        Option.Some(idx) => {
+            let route = g.cfg.routes[idx];
+            match (control.admit(g.ctl, idx)) {
+                control.Verdict.RateLimited => {
+                    emit(field(warn(lg, "rate limited"), "route", route.name));
+                    webserver.text(429, "rate limit exceeded\n")
+                },
+                control.Verdict.BreakerOpen => {
+                    emit(field(warn(lg, "breaker open"), "route", route.name));
+                    webserver.text(503, "upstream unavailable (circuit open)\n")
+                },
+                control.Verdict.Allowed => {
+                    if (route.jwt_secret != "") {
+                        match (proxy.check_jwt(req, route.jwt_secret)) {
+                            Result.Err(e) => {
+                                emit(field(warn(lg, "auth rejected"), "reason", e));
+                                var resp = webserver.text(401, "unauthorized: " + e + "\n");
+                                resp.headers.insert("WWW-Authenticate", "Bearer");
+                                return resp;
+                            },
+                            Result.Ok(z) => { },
+                        }
+                    }
+                    let started = time.monotonic();
+                    let out = if (route.stream) {
+                        proxy.streaming(req, route, t)
+                    } else {
+                        proxy.buffered(req, route, t)
+                    };
+                    let latency = time.monotonic() - started;
+                    control.report(g.ctl, idx, out.ok, latency);
+                    emit(
+                        field_int(
+                            field_int(
+                                field(
+                                    field(info(lg, "proxied"), "route", route.name),
+                                    "method",
+                                    req.method
+                                ),
+                                "status",
+                                out.response.status
+                            ),
+                            "ms",
+                            latency
+                        )
+                    );
+                    out.response
+                },
+            }
+        },
+    }
+}
+
+// Blocks until SIGTERM/SIGINT, then drains for drain_ms.
+pub fn run(cfg: config.Config) -> Result<int, string> {
+    let g = make(cfg);
+    let lg = logger("raygate");
+    emit(field_int(info(lg, "gateway listening"), "port", cfg.server.port));
+    webserver.serve_graceful(cfg.server.bind, cfg.server.port, cfg.server.drain_ms, fn(req: webserver.Request) -> webserver.Response {
+        handle(g, req)
+    })
+}

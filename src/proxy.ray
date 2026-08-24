@@ -1,0 +1,215 @@
+// raygate — the proxy engine: header hygiene, JWT gate, buffered mode with
+// retry + deadline, and streaming mode (upstream body relayed chunk by chunk
+// to the client with backpressure).
+import std/time;
+import std/json;
+import std/resilience;
+import net/http;
+import net/webserver;
+import net/trace;
+from net/jwt import jwt_verify;
+from config import Route;
+
+// Hop-by-hop headers never cross a proxy (RFC 9110 §7.6.1); host and
+// content-length are re-derived per hop, and accept-encoding is dropped so the
+// http client negotiates its own (it un-gzips transparently in buffered mode).
+fn hop_by_hop(name: string) -> bool {
+    let n = name.to_lower();
+    n == "connection" || n == "keep-alive" || n == "proxy-authenticate" || n == "proxy-authorization" || n == "te" || n == "trailer" || n == "transfer-encoding" || n == "upgrade" || n == "host" || n == "content-length" || n == "accept-encoding"
+}
+
+pub fn upstream_url(route: Route, path: string, query: string) -> string {
+    var p = path;
+    if (route.strip_prefix) {
+        p = path.substring(route.prefix.len(), path.len());
+        if (!p.starts_with("/")) {
+            p = "/" + p;
+        }
+    }
+    var url = route.upstream + p;
+    if (query != "") {
+        url = url + "?" + query;
+    }
+    url
+}
+
+// Forwarded headers: originals minus hop-by-hop, plus the route's extras
+// ("Name: value" lines) and the child traceparent.
+fn forward_headers(req: webserver.Request, route: Route, t: trace.Trace) -> Map<string, string> {
+    var h: Map<string, string> = Map.new();
+    for k in req.headers.keys() {
+        if (!hop_by_hop(k)) {
+            match (get(req.headers, k)) {
+                Option.Some(v) => {
+                    h.insert(k, v);
+                },
+                Option.None => { },
+            }
+        }
+    }
+    for line in route.add_request_headers {
+        match (line.index_of(":")) {
+            Option.Some(i) => {
+                h.insert(line.substring(0, i).trim(), line.substring(i + 1, line.len()).trim());
+            },
+            Option.None => { },
+        }
+    }
+    h.insert("traceparent", trace.traceparent(trace.child(t)));
+    h
+}
+
+fn copy_response_headers(from_headers: Map<string, string>, to: webserver.Response) {
+    for k in from_headers.keys() {
+        if (!hop_by_hop(k)) {
+            match (get(from_headers, k)) {
+                Option.Some(v) => {
+                    to.headers.insert(k, v);
+                },
+                Option.None => { },
+            }
+        }
+    }
+    to.headers.insert("X-Gateway", "raygate");
+}
+
+// --- JWT gate ---------------------------------------------------------------
+
+fn bearer_token(req: webserver.Request) -> Option<string> {
+    var raw = "";
+    match (get(req.headers, "authorization")) {
+        Option.Some(v) => {
+            raw = v;
+        },
+        Option.None => {
+            match (get(req.headers, "Authorization")) {
+                Option.Some(v) => {
+                    raw = v;
+                },
+                Option.None => { },
+            }
+        },
+    }
+    if (raw == "") {
+        return Option.None;
+    }
+    if (raw.starts_with("Bearer ")) {
+        return Option.Some(raw.substring(7, raw.len()).trim());
+    }
+    Option.None
+}
+
+// jwt_verify checks the HS256 signature only; exp is application policy, so
+// the gateway enforces it here (a token without exp is accepted).
+pub fn check_jwt(req: webserver.Request, secret: string) -> Result<int, string> {
+    let token = match (bearer_token(req)) {
+        Option.Some(t) => t,
+        Option.None => {
+            return Result.Err("missing bearer token");
+        },
+    };
+    let payload = jwt_verify(secret.to_bytes(), token)?;
+    match (json.parse(payload)) {
+        Result.Ok(j) => {
+            match (json.get_int(j, "exp")) {
+                Option.Some(exp) => {
+                    if (exp * 1000 < time.now()) {
+                        return Result.Err("token expired");
+                    }
+                },
+                Option.None => { },
+            }
+        },
+        Result.Err(e) => {
+            return Result.Err("unreadable payload");
+        },
+    }
+    Result.Ok(0)
+}
+
+// --- Buffered mode ----------------------------------------------------------
+
+fn idempotent(method: string) -> bool {
+    method == "GET" || method == "HEAD" || method == "OPTIONS"
+}
+
+pub struct ProxyOutcome {
+    response: webserver.Response,
+    ok: bool,
+}
+
+// Retries wrap the whole upstream call under one deadline: each attempt gets
+// the REMAINING budget as its read timeout, so retries never extend the
+// route's total time.
+pub fn buffered(req: webserver.Request, route: Route, t: trace.Trace) -> ProxyOutcome {
+    let url = upstream_url(route, req.path, req.query);
+    let headers = forward_headers(req, route, t);
+    let d = resilience.deadline(route.timeout_ms);
+    let attempts = if (route.retries > 0 && idempotent(
+        req.method
+    )) { route.retries + 1 } else { 1 };
+    let p = resilience.policy(attempts, 100, 1000);
+    let method = req.method;
+    let body = req.body;
+    let result = resilience.retry(p, fn() -> Result<http.Response, string> {
+        let left = resilience.remaining(d);
+        if (left <= 0) {
+            return Result.Err("deadline exceeded");
+        }
+        http.request_bytes(method, url, body, headers, left)
+    });
+    match (result) {
+        Result.Ok(up) => {
+            var resp = webserver.bytes_response(up.status, up.body);
+            copy_response_headers(up.headers, resp);
+            ProxyOutcome { response: resp, ok: up.status < 500 }
+        },
+        Result.Err(e) => {
+            ProxyOutcome { response: webserver.text(502, "upstream error: " + e + "\n"), ok: false }
+        },
+    }
+}
+
+// --- Streaming mode ---------------------------------------------------------
+
+// Status and headers come back as soon as the upstream sends them; the body is
+// pumped chunk by chunk through a BOUNDED channel (backpressure: a slow client
+// slows the pull from the upstream). No retries: bytes may already be in
+// flight.
+pub fn streaming(req: webserver.Request, route: Route, t: trace.Trace) -> ProxyOutcome {
+    let url = upstream_url(route, req.path, req.query);
+    let headers = forward_headers(req, route, t);
+    match (http.stream_with(req.method, url, req.body, headers, route.timeout_ms)) {
+        Result.Ok(s) => {
+            let ch: Channel<bytes> = Channel.bounded(8);
+            spawn(fn() {
+                var pumping = true;
+                while (pumping) {
+                    match (http.stream_read(s)) {
+                        Result.Ok(chunk_opt) => {
+                            match (chunk_opt) {
+                                Option.Some(chunk) => {
+                                    send(ch, chunk);
+                                },
+                                Option.None => {
+                                    pumping = false;
+                                },
+                            }
+                        },
+                        Result.Err(e) => {
+                            pumping = false;
+                        },
+                    }
+                }
+                http.stream_close(s);
+                close(ch);
+            });
+            var resp = webserver.stream_response(s.status, ch);
+            copy_response_headers(s.headers, resp);
+            ProxyOutcome { response: resp, ok: s.status < 500 }
+        },
+        Result.Err(e) => {
+            ProxyOutcome { response: webserver.text(502, "upstream error: " + e + "\n"), ok: false }
+        },
+    }
+}

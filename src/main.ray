@@ -1,0 +1,76 @@
+// raygate — API gateway / reverse proxy over declarative TOML routes.
+import std/fs;
+import config;
+import gateway;
+
+fn usage() {
+    eprint("usage:");
+    eprint("  raygate [--config raygate.toml]   serve (default config: ./raygate.toml)");
+    eprint("  raygate check [--config FILE]     validate the config and list routes");
+}
+
+fn config_path(av: [string]) -> string {
+    var i = 0;
+    while (i + 1 < av.len()) {
+        if (av[i] == "--config") {
+            return av[i + 1];
+        }
+        i = i + 1;
+    }
+    "raygate.toml"
+}
+
+fn load(path: string) -> Result<config.Config, string> {
+    let src = fs.read_file(path)?;
+    config.parse_config(src)
+}
+
+fn describe(cfg: config.Config) {
+    print("listen " + cfg.server.bind + ":" + to_string(cfg.server.port));
+    for r in cfg.routes {
+        var extras = "";
+        if (r.jwt_secret != "") {
+            extras = extras + " +jwt";
+        }
+        if (r.rate_limit > 0) {
+            extras = extras + " +rate:" + to_string(r.rate_limit) + "/s";
+        }
+        if (r.retries > 0) {
+            extras = extras + " +retries:" + to_string(r.retries);
+        }
+        if (r.stream) {
+            extras = extras + " +stream";
+        }
+        print(
+            "  " + r.prefix + " -> " + r.upstream + " (timeout " + to_string(r.timeout_ms) + " ms, breaker " + to_string(r.breaker_threshold) + "/" + to_string(r.breaker_cooldown_ms) + " ms" + extras + ")"
+        );
+    }
+}
+
+fn main() -> int {
+    let av = args();
+    if (av.len() > 0 && (av[0] == "--help" || av[0] == "-h" || av[0] == "help")) {
+        usage();
+        return 0;
+    }
+    let check_only = av.len() > 0 && av[0] == "check";
+    match (load(config_path(av))) {
+        Result.Err(e) => {
+            eprint("raygate: " + e);
+            1
+        },
+        Result.Ok(cfg) => {
+            describe(cfg);
+            if (check_only) {
+                return 0;
+            }
+            match (gateway.run(cfg)) {
+                Result.Ok(code) => code,
+                Result.Err(e) => {
+                    eprint("raygate: " + e);
+                    1
+                },
+            }
+        },
+    }
+}

@@ -1,0 +1,12 @@
+import net/webserver;
+
+fn handler(req: webserver.Request) -> webserver.Response {
+    webserver.text(200, "ok")
+}
+
+fn main() -> int {
+    match (webserver.serve("127.0.0.1", 18921, handler)) {
+        Result.Ok(n) => 0,
+        Result.Err(e) => { eprint(e); 1 },
+    }
+}

@@ -1,0 +1,174 @@
+// raygate — the control actor: rate limits, circuit breakers and metrics.
+//
+// Handler fibers must not share mutable state, so admission control and the
+// metrics registry live here. A request asks Admit before calling upstream and
+// Reports the outcome after; the breaker bookkeeping mirrors what
+// resilience.guard does — guard itself is unusable when the protected call
+// cannot run inside the state's owner fiber (a recorded API-shape finding).
+import std/time;
+import std/resilience;
+import net/metrics;
+from config import Config, Route;
+
+pub enum Verdict {
+    Allowed,
+    RateLimited,
+    BreakerOpen,
+}
+
+pub enum Ctl {
+    Admit(int, Channel<Verdict>),
+    Report(int, bool, int),
+    Scrape(Channel<string>),
+}
+
+struct Bucket {
+    tokens: float,
+    last_ms: int,
+}
+
+struct RouteState {
+    route: Route,
+    breaker: resilience.Breaker,
+    bucket: Bucket,
+}
+
+pub fn start(cfg: Config) -> Channel<Ctl> {
+    let ch: Channel<Ctl> = Channel.bounded(256);
+    spawn(fn() {
+        actor_loop(ch, cfg);
+    });
+    ch
+}
+
+fn new_registry() -> metrics.Registry {
+    let reg = metrics.registry();
+    metrics.register_counter(reg, "raygate_requests_total", "requests admitted per route");
+    metrics.register_counter(
+        reg,
+        "raygate_upstream_errors_total",
+        "failed upstream calls per route"
+    );
+    metrics.register_counter(reg, "raygate_rate_limited_total", "requests rejected by rate limit");
+    metrics.register_counter(
+        reg,
+        "raygate_breaker_fastfail_total",
+        "requests rejected by open breaker"
+    );
+    metrics.register_histogram(
+        reg,
+        "raygate_upstream_ms",
+        "upstream latency in ms",
+        [5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0]
+    );
+    reg
+}
+
+// Token bucket: `rate_limit` tokens/second, burst = one second's worth (min 1).
+fn take_token(b: Bucket, rate: int) -> bool {
+    if (rate <= 0) {
+        return true;
+    }
+    let now_ms = time.monotonic();
+    let elapsed = now_ms - b.last_ms;
+    b.last_ms = now_ms;
+    let cap = if (rate < 1) { 1.0 } else { rate as float };
+    var tokens = b.tokens + elapsed as float * rate as float / 1000.0;
+    if (tokens > cap) {
+        tokens = cap;
+    }
+    if (tokens < 1.0) {
+        b.tokens = tokens;
+        return false;
+    }
+    b.tokens = tokens - 1.0;
+    true
+}
+
+// The same transitions resilience.guard applies, driven by Report messages.
+fn report_to_breaker(b: resilience.Breaker, ok: bool) {
+    if (ok) {
+        b.failures = 0;
+    } else {
+        b.failures = b.failures + 1;
+        if (b.failures >= b.threshold) {
+            b.abierto_hasta = time.monotonic() + b.cooldown_ms;
+            b.failures = 0;
+        }
+    }
+}
+
+fn actor_loop(ch: Channel<Ctl>, cfg: Config) {
+    var states: [RouteState] = [];
+    for r in cfg.routes {
+        states.push(
+            RouteState {
+                route: r,
+                breaker: resilience.breaker(r.breaker_threshold, r.breaker_cooldown_ms),
+                bucket: Bucket { tokens: r.rate_limit as float, last_ms: time.monotonic() }
+            }
+        );
+    }
+    let reg = new_registry();
+    var running = true;
+    while (running) {
+        match (recv(ch)) {
+            Option.None => {
+                running = false;
+            },
+            Option.Some(msg) => {
+                match (msg) {
+                    Ctl.Admit(idx, reply) => {
+                        let st = states[idx];
+                        let labels = metrics.labels1("route", st.route.name);
+                        if (resilience.is_open(st.breaker)) {
+                            metrics.inc(reg, "raygate_breaker_fastfail_total", labels);
+                            send(reply, Verdict.BreakerOpen);
+                        } else if (!take_token(st.bucket, st.route.rate_limit)) {
+                            metrics.inc(reg, "raygate_rate_limited_total", labels);
+                            send(reply, Verdict.RateLimited);
+                        } else {
+                            metrics.inc(reg, "raygate_requests_total", labels);
+                            send(reply, Verdict.Allowed);
+                        }
+                    },
+                    Ctl.Report(idx, ok, latency_ms) => {
+                        let st = states[idx];
+                        let labels = metrics.labels1("route", st.route.name);
+                        report_to_breaker(st.breaker, ok);
+                        if (!ok) {
+                            metrics.inc(reg, "raygate_upstream_errors_total", labels);
+                        }
+                        metrics.observe_l(reg, "raygate_upstream_ms", labels, latency_ms as float);
+                    },
+                    Ctl.Scrape(reply) => {
+                        send(reply, metrics.render(reg));
+                    },
+                }
+            },
+        }
+    }
+}
+
+// Helper for handlers: one Admit round trip.
+pub fn admit(ctl: Channel<Ctl>, idx: int) -> Verdict {
+    let reply: Channel<Verdict> = Channel.bounded(1);
+    send(ctl, Ctl.Admit(idx, reply));
+    match (recv(reply)) {
+        Option.Some(v) => v,
+        Option.None => Verdict.Allowed,
+    }
+}
+
+pub fn report(ctl: Channel<Ctl>, idx: int, ok: bool, latency_ms: int) {
+    send(ctl, Ctl.Report(idx, ok, latency_ms));
+}
+
+pub fn scrape(ctl: Channel<Ctl>) -> string {
+    let reply: Channel<string> = Channel.bounded(1);
+    send(ctl, Ctl.Scrape(reply));
+    match (recv(reply)) {
+        Option.Some(s) => s,
+        Option.None => "",
+    }
+}

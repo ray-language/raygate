@@ -1,0 +1,23 @@
+import std/time;
+import net/webserver;
+
+fn handler(req: webserver.Request) -> webserver.Response {
+    let ch: Channel<bytes> = Channel.bounded(4);
+    spawn(fn() {
+        var i = 0;
+        while (i < 5) {
+            send(ch, ("tick" + to_string(i) + "\n").to_bytes());
+            time.sleep(100);
+            i = i + 1;
+        }
+        close(ch);
+    });
+    webserver.stream_response(200, ch)
+}
+
+fn main() -> int {
+    match (webserver.serve("127.0.0.1", 18931, handler)) {
+        Result.Ok(n) => 0,
+        Result.Err(e) => { eprint(e); 1 },
+    }
+}

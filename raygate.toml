@@ -1,0 +1,33 @@
+# raygate example configuration.
+#
+# Routes are NAMED tables ([route.<name>]) because std/toml does not support
+# arrays of tables ([[route]]) yet; the name doubles as the metrics label.
+
+[server]
+bind = "127.0.0.1"
+port = 8080
+drain_ms = 3000
+metrics_path = "/metrics"
+health_path = "/health"
+
+[route.api]
+prefix = "/api/"
+upstream = "http://127.0.0.1:9001"
+strip_prefix = true
+timeout_ms = 5000
+retries = 2
+breaker_threshold = 5
+breaker_cooldown_ms = 10000
+rate_limit = 50
+add_request_headers = ["X-Gateway: raygate"]
+
+[route.events]
+prefix = "/events/"
+upstream = "http://127.0.0.1:9002"
+stream = true
+timeout_ms = 30000
+
+[route.admin]
+prefix = "/admin/"
+upstream = "http://127.0.0.1:9003"
+jwt_secret = "change-me"

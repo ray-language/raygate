@@ -1,0 +1,224 @@
+// End-to-end: a real upstream webserver and a real gateway, both in fibers.
+import std/time;
+import std/net;
+import net/http;
+import net/webserver;
+from net/jwt import jwt_sign;
+import config;
+import gateway;
+
+const UPSTREAM_PORT: int = 18901;
+
+const STREAM_PORT: int = 18902;
+
+const GATE_PORT: int = 18903;
+
+const DEAD_PORT: int = 18999;
+
+fn upstream_handler(req: webserver.Request) -> webserver.Response {
+    if (req.path == "/boom") {
+        return webserver.text(500, "kaput");
+    }
+    let tp = match (get(req.headers, "traceparent")) {
+        Option.Some(v) => v,
+        Option.None => "",
+    };
+    let gw = match (get(req.headers, "x-gateway")) {
+        Option.Some(v) => v,
+        Option.None => {
+            match (get(req.headers, "X-Gateway")) {
+                Option.Some(v) => v,
+                Option.None => "",
+            }
+        },
+    };
+    var resp = webserver.text(200, "path=" + req.path + " trace=" + tp + " gw=" + gw);
+    resp.headers.insert("X-Upstream", "echo");
+    resp
+}
+
+fn stream_handler(req: webserver.Request) -> webserver.Response {
+    let ch: Channel<bytes> = Channel.bounded(4);
+    spawn(fn() {
+        var i = 0;
+        while (i < 3) {
+            send(ch, ("chunk" + to_string(i) + ";").to_bytes());
+            time.sleep(30);
+            i = i + 1;
+        }
+        close(ch);
+    });
+    webserver.stream_response(200, ch)
+}
+
+const GATE_CFG: string = `
+[server]
+bind = "127.0.0.1"
+port = 18903
+metrics_path = "/metrics"
+
+[route.api]
+prefix = "/api/"
+upstream = "http://127.0.0.1:18901"
+strip_prefix = true
+
+[route.limited]
+prefix = "/limited/"
+upstream = "http://127.0.0.1:18901"
+rate_limit = 2
+
+[route.secure]
+prefix = "/secure/"
+upstream = "http://127.0.0.1:18901"
+jwt_secret = "test-secret"
+
+[route.broken]
+prefix = "/broken/"
+upstream = "http://127.0.0.1:18999"
+timeout_ms = 500
+breaker_threshold = 2
+breaker_cooldown_ms = 60000
+
+[route.events]
+prefix = "/events/"
+upstream = "http://127.0.0.1:18902"
+stream = true
+`;
+
+// Everything runs inside ONE @test: the ray test runner discards fibers
+// between tests while their OS listeners survive, so servers booted in an
+// earlier test are half-dead in the next (accepting but unserved) — a
+// recorded finding. One boot, one test, sequential scenarios.
+fn boot() {
+    spawn(fn() {
+        webserver.serve("127.0.0.1", UPSTREAM_PORT, upstream_handler);
+    });
+    spawn(fn() {
+        webserver.serve("127.0.0.1", STREAM_PORT, stream_handler);
+    });
+    let cfg = match (config.parse_config(GATE_CFG)) {
+        Result.Ok(c) => c,
+        Result.Err(e) => panic(e),
+    };
+    let g = gateway.make(cfg);
+    spawn(fn() {
+        webserver.serve("127.0.0.1", GATE_PORT, fn(req: webserver.Request) -> webserver.Response {
+            gateway.handle(g, req)
+        });
+    });
+    time.sleep(200);
+}
+
+fn fetch_gate(path: string) -> http.Response {
+    match (http.fetch("http://127.0.0.1:" + to_string(GATE_PORT) + path)) {
+        Result.Ok(r) => r,
+        Result.Err(e) => panic("fetch " + path + ": " + e),
+    }
+}
+
+fn body_of(r: http.Response) -> string {
+    match (from_utf8(r.body)) {
+        Result.Ok(s) => s,
+        Result.Err(e) => panic(e),
+    }
+}
+
+fn scenario_proxy_basics() {
+    let r = fetch_gate("/api/users?id=7");
+    assert_eq(r.status, 200);
+    let body = body_of(r);
+    assert(body.contains("path=/users"));
+    assert(body.contains("trace=00-"));
+    match (http.header(r, "x-upstream")) {
+        Option.Some(v) => assert_eq(v, "echo"),
+        Option.None => panic("missing X-Upstream"),
+    }
+    match (http.header(r, "x-gateway")) {
+        Option.Some(v) => assert_eq(v, "raygate"),
+        Option.None => panic("missing X-Gateway"),
+    }
+}
+
+fn scenario_404() {
+    assert_eq(fetch_gate("/nope").status, 404);
+}
+
+fn scenario_health_metrics() {
+    assert_eq(fetch_gate("/health").status, 200);
+    let m = fetch_gate("/metrics");
+    assert_eq(m.status, 200);
+    assert(body_of(m).contains("raygate_requests_total"));
+}
+
+fn scenario_jwt() {
+    assert_eq(fetch_gate("/secure/x").status, 401);
+    let good = jwt_sign("test-secret".to_bytes(), "{\"sub\":\"ana\"}");
+    var h: Map<string, string> = Map.new();
+    h.insert("Authorization", "Bearer " + good);
+    let url = "http://127.0.0.1:" + to_string(GATE_PORT) + "/secure/x";
+    match (http.request_with("GET", url, "", h)) {
+        Result.Ok(r) => assert_eq(r.status, 200),
+        Result.Err(e) => panic(e),
+    }
+    let expired = jwt_sign("test-secret".to_bytes(), "{\"sub\":\"ana\",\"exp\":1000000}");
+    var h2: Map<string, string> = Map.new();
+    h2.insert("Authorization", "Bearer " + expired);
+    match (http.request_with("GET", url, "", h2)) {
+        Result.Ok(r) => assert_eq(r.status, 401),
+        Result.Err(e) => panic(e),
+    }
+    var h3: Map<string, string> = Map.new();
+    h3.insert("Authorization", "Bearer no.a.jwt");
+    match (http.request_with("GET", url, "", h3)) {
+        Result.Ok(r) => assert_eq(r.status, 401),
+        Result.Err(e) => panic(e),
+    }
+}
+
+fn scenario_rate_limit() {
+    var ok = 0;
+    var limited = 0;
+    var i = 0;
+    while (i < 6) {
+        let r = fetch_gate("/limited/ping");
+        if (r.status == 200) {
+            ok = ok + 1;
+        } else if (r.status == 429) {
+            limited = limited + 1;
+        }
+        i = i + 1;
+    }
+    assert(ok >= 1);
+    assert(limited >= 1);
+    assert_eq(ok + limited, 6);
+}
+
+fn scenario_breaker() {
+    // Two connect failures (dead port) reach the threshold…
+    assert_eq(fetch_gate("/broken/a").status, 502);
+    assert_eq(fetch_gate("/broken/b").status, 502);
+    // …and the third request fails FAST with 503 (circuit open).
+    let started = time.monotonic();
+    let r = fetch_gate("/broken/c");
+    let elapsed = time.monotonic() - started;
+    assert_eq(r.status, 503);
+    assert(elapsed < 400);
+}
+
+fn scenario_streaming() {
+    let r = fetch_gate("/events/feed");
+    assert_eq(r.status, 200);
+    assert_eq(body_of(r), "chunk0;chunk1;chunk2;");
+}
+
+@test
+fn gateway_end_to_end() {
+    boot();
+    scenario_proxy_basics();
+    scenario_404();
+    scenario_health_metrics();
+    scenario_jwt();
+    scenario_rate_limit();
+    scenario_breaker();
+    scenario_streaming();
+}

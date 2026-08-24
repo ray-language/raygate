@@ -1,0 +1,183 @@
+// raygate — declarative TOML configuration.
+//
+// Routes are NAMED tables (`[route.api]`): std/toml defers arrays of tables
+// (`[[route]]`), so the natural reverse-proxy config shape is not expressible
+// yet — a recorded finding. Route names double as the metrics label.
+import std/toml;
+from std/toml import TomlValue, TomlEntry;
+
+pub struct ServerCfg {
+    bind: string,
+    port: int,
+    drain_ms: int,
+    metrics_path: string,
+    health_path: string,
+}
+
+pub struct Route {
+    name: string,
+    prefix: string,
+    upstream: string,
+    strip_prefix: bool,
+    timeout_ms: int,
+    retries: int,
+    breaker_threshold: int,
+    breaker_cooldown_ms: int,
+    rate_limit: int,
+    jwt_secret: string,
+    stream: bool,
+    add_request_headers: [string],
+}
+
+pub struct Config {
+    server: ServerCfg,
+    routes: [Route],
+}
+
+fn get_str(entries: [TomlEntry], key: string, fallback: string) -> string {
+    match (toml.toml_get(entries, key)) {
+        Option.Some(v) => {
+            match (v) {
+                TomlValue.TStr(s) => s,
+                _ => fallback,
+            }
+        },
+        Option.None => fallback,
+    }
+}
+
+fn get_int(entries: [TomlEntry], key: string, fallback: int) -> int {
+    match (toml.toml_get(entries, key)) {
+        Option.Some(v) => {
+            match (v) {
+                TomlValue.TInt(n) => n,
+                _ => fallback,
+            }
+        },
+        Option.None => fallback,
+    }
+}
+
+fn get_bool(entries: [TomlEntry], key: string, fallback: bool) -> bool {
+    match (toml.toml_get(entries, key)) {
+        Option.Some(v) => {
+            match (v) {
+                TomlValue.TBool(b) => b,
+                _ => fallback,
+            }
+        },
+        Option.None => fallback,
+    }
+}
+
+fn get_str_array(entries: [TomlEntry], key: string) -> [string] {
+    var out: [string] = [];
+    match (toml.toml_get(entries, key)) {
+        Option.Some(v) => {
+            match (v) {
+                TomlValue.TArray(items) => {
+                    for item in items {
+                        match (item) {
+                            TomlValue.TStr(s) => {
+                                out.push(s);
+                            },
+                            _ => { },
+                        }
+                    }
+                },
+                _ => { },
+            }
+        },
+        Option.None => { },
+    }
+    out
+}
+
+// Route names in order of first appearance among the `route.<name>.*` keys.
+fn route_names(entries: [TomlEntry]) -> [string] {
+    var names: [string] = [];
+    for e in entries {
+        if (e.key.starts_with("route.")) {
+            let rest = e.key.substring(6, e.key.len());
+            match (rest.index_of(".")) {
+                Option.Some(dot) => {
+                    let name = rest.substring(0, dot);
+                    if (!names.contains(name)) {
+                        names.push(name);
+                    }
+                },
+                Option.None => { },
+            }
+        }
+    }
+    names
+}
+
+fn parse_route(entries: [TomlEntry], name: string) -> Result<Route, string> {
+    let base = "route." + name + ".";
+    let prefix = get_str(entries, base + "prefix", "");
+    let upstream = get_str(entries, base + "upstream", "");
+    if (prefix == "") {
+        return Result.Err("route '" + name + "': missing 'prefix'");
+    }
+    if (!prefix.starts_with("/")) {
+        return Result.Err("route '" + name + "': prefix must start with '/'");
+    }
+    if (upstream == "") {
+        return Result.Err("route '" + name + "': missing 'upstream'");
+    }
+    if (!upstream.starts_with("http://") && !upstream.starts_with("https://")) {
+        return Result.Err("route '" + name + "': upstream must be http:// or https://");
+    }
+    Result.Ok(
+        Route {
+            name: name,
+            prefix: prefix,
+            upstream: upstream,
+            strip_prefix: get_bool(entries, base + "strip_prefix", false),
+            timeout_ms: get_int(entries, base + "timeout_ms", 10000),
+            retries: get_int(entries, base + "retries", 0),
+            breaker_threshold: get_int(entries, base + "breaker_threshold", 5),
+            breaker_cooldown_ms: get_int(entries, base + "breaker_cooldown_ms", 10000),
+            rate_limit: get_int(entries, base + "rate_limit", 0),
+            jwt_secret: get_str(entries, base + "jwt_secret", ""),
+            stream: get_bool(entries, base + "stream", false),
+            add_request_headers: get_str_array(entries, base + "add_request_headers")
+        }
+    )
+}
+
+pub fn parse_config(src: string) -> Result<Config, string> {
+    let entries = toml.parse_toml(src)?;
+    let server = ServerCfg {
+        bind: get_str(entries, "server.bind", "0.0.0.0"),
+        port: get_int(entries, "server.port", 8080),
+        drain_ms: get_int(entries, "server.drain_ms", 3000),
+        metrics_path: get_str(entries, "server.metrics_path", "/metrics"),
+        health_path: get_str(entries, "server.health_path", "/health")
+    };
+    var routes: [Route] = [];
+    for name in route_names(entries) {
+        routes.push(parse_route(entries, name)?);
+    }
+    if (routes.len() == 0) {
+        return Result.Err("no routes: add at least one [route.<name>] table");
+    }
+    Result.Ok(Config { server: server, routes: routes })
+}
+
+// Longest matching prefix wins; None if nothing matches.
+pub fn match_route(routes: [Route], path: string) -> Option<int> {
+    var best = 0 - 1;
+    var best_len = 0 - 1;
+    var i = 0;
+    while (i < routes.len()) {
+        let p = routes[i].prefix;
+        if (path.starts_with(p) && p.len() > best_len) {
+            best = i;
+            best_len = p.len();
+        }
+        i = i + 1;
+    }
+    if (best < 0) { Option.None } else { Option.Some(best) }
+}

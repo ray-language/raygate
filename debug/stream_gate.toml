@@ -1,0 +1,7 @@
+[server]
+bind = "127.0.0.1"
+port = 18932
+[route.events]
+prefix = "/events/"
+upstream = "http://127.0.0.1:18931"
+stream = true

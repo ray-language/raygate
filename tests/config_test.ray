@@ -1,0 +1,77 @@
+// Config parsing and route matching.
+import config;
+
+const SAMPLE: string = `
+[server]
+port = 9090
+
+[route.api]
+prefix = "/api/"
+upstream = "http://127.0.0.1:9001"
+strip_prefix = true
+retries = 2
+rate_limit = 50
+
+[route.root]
+prefix = "/"
+upstream = "http://127.0.0.1:9002"
+`;
+
+fn parsed() -> config.Config {
+    match (config.parse_config(SAMPLE)) {
+        Result.Ok(c) => c,
+        Result.Err(e) => panic(e),
+    }
+}
+
+@test
+fn parses_server_and_routes_with_defaults() {
+    let c = parsed();
+    assert_eq(c.server.port, 9090);
+    assert_eq(c.server.bind, "0.0.0.0");
+    assert_eq(c.server.metrics_path, "/metrics");
+    assert_eq(c.routes.len(), 2);
+    let api = c.routes[0];
+    assert_eq(api.name, "api");
+    assert_eq(api.prefix, "/api/");
+    assert(api.strip_prefix);
+    assert_eq(api.retries, 2);
+    assert_eq(api.rate_limit, 50);
+    assert_eq(api.timeout_ms, 10000);
+    assert_eq(api.breaker_threshold, 5);
+    assert_eq(api.jwt_secret, "");
+    assert(!api.stream);
+}
+
+@test
+fn longest_prefix_wins() {
+    let c = parsed();
+    match (config.match_route(c.routes, "/api/users")) {
+        Option.Some(i) => assert_eq(c.routes[i].name, "api"),
+        Option.None => panic("expected api"),
+    }
+    match (config.match_route(c.routes, "/other")) {
+        Option.Some(i) => assert_eq(c.routes[i].name, "root"),
+        Option.None => panic("expected root"),
+    }
+}
+
+@test
+fn rejects_bad_configs() {
+    match (config.parse_config("[server]\nport = 1\n")) {
+        Result.Err(e) => assert(e.contains("no routes")),
+        Result.Ok(c) => panic("expected error: no routes"),
+    }
+    match (config.parse_config("[route.a]\nprefix = \"/x/\"\n")) {
+        Result.Err(e) => assert(e.contains("upstream")),
+        Result.Ok(c) => panic("expected error: missing upstream"),
+    }
+    match (config.parse_config("[route.a]\nprefix = \"x\"\nupstream = \"http://h\"\n")) {
+        Result.Err(e) => assert(e.contains("start with")),
+        Result.Ok(c) => panic("expected error: bad prefix"),
+    }
+    match (config.parse_config("[route.a]\nprefix = \"/x\"\nupstream = \"ftp://h\"\n")) {
+        Result.Err(e) => assert(e.contains("http")),
+        Result.Ok(c) => panic("expected error: bad scheme"),
+    }
+}
