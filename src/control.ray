@@ -17,7 +17,7 @@ pub enum Verdict {
 }
 
 pub enum Ctl {
-    Admit(int, Channel<Verdict>),
+    Admit(int, string, Channel<Verdict>),
     Report(int, bool, int),
     Scrape(Channel<string>),
 }
@@ -30,7 +30,10 @@ struct Bucket {
 struct RouteState {
     route: Route,
     breaker: resilience.Breaker,
-    bucket: Bucket,
+    // Rate limit POR IP (raylang M123: webserver.Request.remote): un bucket por cliente.
+    // Tope defensivo: si el mapa crece demasiado (rotacion masiva de IPs) se vacia entero —
+    // burdo pero acotado; los buckets renacen llenos.
+    buckets: Map<string, Bucket>,
 }
 
 pub fn start(cfg: Config) -> Channel<Ctl> {
@@ -62,6 +65,22 @@ fn new_registry() -> metrics.Registry {
         [5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0]
     );
     reg
+}
+
+// El bucket del cliente `ip` en la ruta (se crea LLENO la primera vez; la clave "" agrupa a
+// los clientes cuyo remoto no se pudo leer). Tope defensivo de 10k IPs por ruta.
+fn bucket_for(st: RouteState, ip: string) -> Bucket {
+    match (get(st.buckets, ip)) {
+        Option.Some(b) => b,
+        Option.None => {
+            if (st.buckets.keys().len() >= 10000) {
+                st.buckets = Map.new();
+            }
+            let b = Bucket { tokens: st.route.rate_limit as float, last_ms: time.monotonic() };
+            st.buckets.insert(ip, b);
+            b
+        },
+    }
 }
 
 // Token bucket: `rate_limit` tokens/second, burst = one second's worth (min 1).
@@ -105,7 +124,7 @@ fn actor_loop(ch: Channel<Ctl>, cfg: Config) {
             RouteState {
                 route: r,
                 breaker: resilience.breaker(r.breaker_threshold, r.breaker_cooldown_ms),
-                bucket: Bucket { tokens: r.rate_limit as float, last_ms: time.monotonic() }
+                buckets: Map.new()
             }
         );
     }
@@ -118,13 +137,13 @@ fn actor_loop(ch: Channel<Ctl>, cfg: Config) {
             },
             Option.Some(msg) => {
                 match (msg) {
-                    Ctl.Admit(idx, reply) => {
+                    Ctl.Admit(idx, ip, reply) => {
                         let st = states[idx];
                         let labels = metrics.labels1("route", st.route.name);
                         if (resilience.is_open(st.breaker)) {
                             metrics.inc(reg, "raygate_breaker_fastfail_total", labels);
                             send(reply, Verdict.BreakerOpen);
-                        } else if (!take_token(st.bucket, st.route.rate_limit)) {
+                        } else if (!take_token(bucket_for(st, ip), st.route.rate_limit)) {
                             metrics.inc(reg, "raygate_rate_limited_total", labels);
                             send(reply, Verdict.RateLimited);
                         } else {
@@ -151,9 +170,9 @@ fn actor_loop(ch: Channel<Ctl>, cfg: Config) {
 }
 
 // Helper for handlers: one Admit round trip.
-pub fn admit(ctl: Channel<Ctl>, idx: int) -> Verdict {
+pub fn admit(ctl: Channel<Ctl>, idx: int, ip: string) -> Verdict {
     let reply: Channel<Verdict> = Channel.bounded(1);
-    send(ctl, Ctl.Admit(idx, reply));
+    send(ctl, Ctl.Admit(idx, ip, reply));
     match (recv(reply)) {
         Option.Some(v) => v,
         Option.None => Verdict.Allowed,
