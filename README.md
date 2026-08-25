@@ -1,6 +1,6 @@
 # raygate
 
-API gateway / reverse proxy escrito en [raylang](https://github.com/roberto-ayala/raylang): rutas declarativas en TOML, rate limiting, circuit breaker por upstream, validación JWT, reintentos bajo deadline, **proxy en streaming** (cuerpo-a-cuerpo, con contrapresión), métricas Prometheus, trace-context W3C propagado y logs JSON con `trace_id`. Es la app que estruja el eje servidor completo del lenguaje: `net/webserver` y el cliente `net/http` a la vez, `std/resilience`, `net/{jwt,trace,metrics,log}` y fibras bajo carga.
+API gateway / reverse proxy escrito en [raylang](https://github.com/ray-language/raylang): rutas declarativas en TOML, rate limiting, circuit breaker por upstream, validación JWT, reintentos bajo deadline, **proxy en streaming** (cuerpo-a-cuerpo, con contrapresión), métricas Prometheus, trace-context W3C propagado y logs JSON con `trace_id`. Es la app que estruja el eje servidor completo del lenguaje: `net/webserver` y el cliente `net/http` a la vez, `std/resilience`, `net/{jwt,trace,metrics,log}` y fibras bajo carga.
 
 ```text
 $ raygate check --config raygate.toml
