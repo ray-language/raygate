@@ -56,6 +56,16 @@ fn forward_headers(req: webserver.Request, route: Route, t: trace.Trace) -> Map<
         }
     }
     h.insert("traceparent", trace.traceparent(trace.child(t)));
+    // X-Forwarded-For (raylang M123: la IP remota por fin existe): anexa al valor entrante si
+    // el salto anterior ya lo traia, como cualquier proxy real.
+    let client_ip = webserver.remote_ip(req);
+    if (client_ip != "") {
+        let xff = match (get(req.headers, "x-forwarded-for")) {
+            Option.Some(prev) => prev + ", " + client_ip,
+            Option.None => client_ip,
+        };
+        h.insert("X-Forwarded-For", xff);
+    }
     h
 }
 

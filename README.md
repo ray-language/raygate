@@ -86,15 +86,16 @@ req/s en nativo** (generador de carga co-alojado y en VM: cota inferior).
 | Apagado graceful (`serve_graceful`, SIGTERM/SIGINT + drenado) | ✅ |
 | Binario nativo (E2E y streaming verificados) | ✅ |
 | Tests (config + E2E completo con upstreams reales) | ✅ 4 |
-| Rate limit por IP de cliente / X-Forwarded-For | ❌ bloqueado (ver hallazgos) |
+| Rate limit por IP de cliente / X-Forwarded-For | ✅ (raylang M123: `Request.remote`) |
 | Passthrough WebSocket/SSE de larga vida, TLS de entrada | 📋 v2 |
 
 ## Hallazgos de dogfood (necesidades confirmadas del lenguaje)
 
 Anotados en `raylang/IDEAS.md` §65:
 
-1. **`webserver.Request` no expone la dirección del cliente** → imposible el
-   rate limit por IP y el `X-Forwarded-For` que cualquier proxy real necesita.
+1. **[RESUELTO — raylang M123]** `webserver.Request` no expone la dirección
+   del cliente: `Request.remote`/`remote_ip(req)` existen y el gateway hace
+   rate limit POR IP (un bucket por cliente) y anexa `X-Forwarded-For`.
 2. **`ray test` deja listeners medio muertos entre tests**: las fibras de un
    `@test` anterior se descartan pero sus sockets de escucha del SO sobreviven
    (aceptan y nadie atiende) → un boot compartido entre tests se envenena; el

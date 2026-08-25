@@ -30,7 +30,7 @@ pub fn handle(g: Gate, req: webserver.Request) -> webserver.Response {
         Option.None => webserver.text(404, "no route\n"),
         Option.Some(idx) => {
             let route = g.cfg.routes[idx];
-            match (control.admit(g.ctl, idx)) {
+            match (control.admit(g.ctl, idx, webserver.remote_ip(req))) {
                 control.Verdict.RateLimited => {
                     emit(field(warn(lg, "rate limited"), "route", route.name));
                     webserver.text(429, "rate limit exceeded\n")
