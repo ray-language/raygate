@@ -3,4 +3,4 @@ name = "raygate"
 version = "0.1.0"
 
 [dependencies]
-net = "path:../../raylang/packages/net"
+net = "git+https://github.com/ray-language/net@v0.1.0"

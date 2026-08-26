@@ -105,16 +105,9 @@ fn take_token(b: Bucket, rate: int) -> bool {
 }
 
 // The same transitions resilience.guard applies, driven by Report messages.
+// Delegates to std/resilience's admit/report pair (M129) instead of duplicating them.
 fn report_to_breaker(b: resilience.Breaker, ok: bool) {
-    if (ok) {
-        b.failures = 0;
-    } else {
-        b.failures = b.failures + 1;
-        if (b.failures >= b.threshold) {
-            b.abierto_hasta = time.monotonic() + b.cooldown_ms;
-            b.failures = 0;
-        }
-    }
+    resilience.report(b, ok);
 }
 
 fn actor_loop(ch: Channel<Ctl>, cfg: Config) {
