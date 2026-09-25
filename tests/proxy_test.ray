@@ -85,10 +85,8 @@ upstream = "http://127.0.0.1:18902"
 stream = true
 `;
 
-// Everything runs inside ONE @test: the ray test runner discards fibers
-// between tests while their OS listeners survive, so servers booted in an
-// earlier test are half-dead in the next (accepting but unserved) — a
-// recorded finding. One boot, one test, sequential scenarios.
+// Each @test boots its own upstreams and gateway: `ray test` closes every OS handle
+// a test leaves alive (listeners included), so the ports are free for the next one.
 fn boot() {
     spawn(fn() {
         webserver.serve("127.0.0.1", UPSTREAM_PORT, upstream_handler);
@@ -167,6 +165,17 @@ fn scenario_jwt() {
         Result.Ok(r) => assert_eq(r.status, 401),
         Result.Err(e) => panic(e),
     }
+    // Not valid before the year 2286: rejected by the nbf claim.
+    let early = jwt_sign("test-secret".to_bytes(), "{\"sub\":\"ana\",\"nbf\":9999999999}");
+    var h4: Map<string, string> = Map.new();
+    h4.insert("Authorization", "Bearer " + early);
+    match (http.request_with("GET", url, "", h4)) {
+        Result.Ok(r) => {
+            assert_eq(r.status, 401);
+            assert(from_utf8(r.body).unwrap_or("").contains("not yet valid"));
+        },
+        Result.Err(e) => panic(e),
+    }
     var h3: Map<string, string> = Map.new();
     h3.insert("Authorization", "Bearer no.a.jwt");
     match (http.request_with("GET", url, "", h3)) {
@@ -212,13 +221,43 @@ fn scenario_streaming() {
 }
 
 @test
-fn gateway_end_to_end() {
+fn proxies_with_trace_and_gateway_headers() {
     boot();
     scenario_proxy_basics();
+}
+
+@test
+fn unknown_path_is_404() {
+    boot();
     scenario_404();
+}
+
+@test
+fn serves_health_and_metrics() {
+    boot();
     scenario_health_metrics();
+}
+
+@test
+fn jwt_route_checks_signature_and_time_claims() {
+    boot();
     scenario_jwt();
+}
+
+@test
+fn rate_limit_answers_429() {
+    boot();
     scenario_rate_limit();
+}
+
+@test
+fn open_breaker_fails_fast() {
+    boot();
     scenario_breaker();
+}
+
+@test
+fn streams_the_upstream_body() {
+    boot();
     scenario_streaming();
 }

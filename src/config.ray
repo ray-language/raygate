@@ -1,8 +1,9 @@
 // raygate — declarative TOML configuration.
 //
-// Routes are NAMED tables (`[route.api]`): std/toml defers arrays of tables
-// (`[[route]]`), so the natural reverse-proxy config shape is not expressible
-// yet — a recorded finding. Route names double as the metrics label.
+// Routes are either NAMED tables (`[route.api]`, the name is the table key) or an
+// array of tables (`[[route]]`, named by an optional `name` key, else `route<N>`);
+// both shapes may be mixed. Route names double as the metrics label, so they must
+// be unique.
 import std/toml;
 from std/toml import TomlValue, TomlEntry;
 
@@ -93,28 +94,43 @@ fn get_str_array(entries: [TomlEntry], key: string) -> [string] {
     out
 }
 
-// Route names in order of first appearance among the `route.<name>.*` keys.
-fn route_names(entries: [TomlEntry]) -> [string] {
-    var names: [string] = [];
+// Route tables in order of first appearance among the `route.<id>.*` keys: `<id>` is
+// the name of a `[route.<name>]` table or the index of a `[[route]]` entry.
+fn route_ids(entries: [TomlEntry]) -> [string] {
+    var ids: [string] = [];
     for e in entries {
         if (e.key.starts_with("route.")) {
             let rest = e.key.substring(6, e.key.len());
             match (rest.index_of(".")) {
                 Option.Some(dot) => {
-                    let name = rest.substring(0, dot);
-                    if (!names.contains(name)) {
-                        names.push(name);
+                    let id = rest.substring(0, dot);
+                    if (!ids.contains(id)) {
+                        ids.push(id);
                     }
                 },
                 Option.None => { },
             }
         }
     }
-    names
+    ids
 }
 
-fn parse_route(entries: [TomlEntry], name: string) -> Result<Route, string> {
-    let base = "route." + name + ".";
+// The metrics name of the route table `id`: a `[[route]]` entry uses its `name` key
+// (or `route<N>`), a named table its own key.
+fn route_name(entries: [TomlEntry], id: string, array_len: int) -> string {
+    let indexed = match (parse_int(id)) {
+        Option.Some(i) => i >= 0 && i < array_len,
+        Option.None => false,
+    };
+    if (indexed) {
+        get_str(entries, "route." + id + ".name", "route" + id)
+    } else {
+        id
+    }
+}
+
+fn parse_route(entries: [TomlEntry], id: string, name: string) -> Result<Route, string> {
+    let base = "route." + id + ".";
     let prefix = get_str(entries, base + "prefix", "");
     let upstream = get_str(entries, base + "upstream", "");
     if (prefix == "") {
@@ -156,20 +172,27 @@ pub fn parse_config(src: string) -> Result<Config, string> {
         metrics_path: get_str(entries, "server.metrics_path", "/metrics"),
         health_path: get_str(entries, "server.health_path", "/health")
     };
+    let array_len = toml.toml_array_len(entries, "route");
     var routes: [Route] = [];
-    for name in route_names(entries) {
-        routes.push(parse_route(entries, name)?);
+    var names: [string] = [];
+    for id in route_ids(entries) {
+        let name = route_name(entries, id, array_len);
+        if (names.contains(name)) {
+            return Result.Err("route '" + name + "' is defined twice");
+        }
+        names.push(name);
+        routes.push(parse_route(entries, id, name)?);
     }
     if (routes.len() == 0) {
-        return Result.Err("no routes: add at least one [route.<name>] table");
+        return Result.Err("no routes: add at least one [route.<name>] or [[route]] table");
     }
     Result.Ok(Config { server: server, routes: routes })
 }
 
 // Longest matching prefix wins; None if nothing matches.
 pub fn match_route(routes: [Route], path: string) -> Option<int> {
-    var best = 0 - 1;
-    var best_len = 0 - 1;
+    var best = -1;
+    var best_len = -1;
     var i = 0;
     while (i < routes.len()) {
         let p = routes[i].prefix;

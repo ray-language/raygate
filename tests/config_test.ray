@@ -75,3 +75,47 @@ fn rejects_bad_configs() {
         Result.Ok(c) => panic("expected error: bad scheme"),
     }
 }
+
+@test
+fn accepts_arrays_of_tables_mixed_with_named_tables() {
+    let src = `
+[[route]]
+name = "api"
+prefix = "/api/"
+upstream = "http://127.0.0.1:9001"
+
+[[route]]
+prefix = "/events/"
+upstream = "http://127.0.0.1:9002"
+stream = true
+
+[route.root]
+prefix = "/"
+upstream = "http://127.0.0.1:9003"
+`;
+    match (config.parse_config(src)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(c) => {
+            assert_eq(c.routes.len(), 3);
+            assert_eq(c.routes[0].name, "api");
+            assert_eq(c.routes[0].prefix, "/api/");
+            assert_eq(c.routes[1].name, "route1");
+            assert(c.routes[1].stream);
+            assert_eq(c.routes[2].name, "root");
+        },
+    }
+    let twice = `
+[[route]]
+name = "api"
+prefix = "/a/"
+upstream = "http://h"
+
+[route.api]
+prefix = "/b/"
+upstream = "http://h"
+`;
+    match (config.parse_config(twice)) {
+        Result.Err(e) => assert(e.contains("defined twice")),
+        Result.Ok(c) => panic("expected error: duplicate route name"),
+    }
+}

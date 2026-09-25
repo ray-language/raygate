@@ -2,9 +2,9 @@
 //
 // Handler fibers must not share mutable state, so admission control and the
 // metrics registry live here. A request asks Admit before calling upstream and
-// Reports the outcome after; the breaker bookkeeping mirrors what
-// resilience.guard does — guard itself is unusable when the protected call
-// cannot run inside the state's owner fiber (a recorded API-shape finding).
+// Reports the outcome after. The protected call runs in the handler fiber, not
+// in the breaker's owner, so instead of resilience.guard the actor drives the
+// breaker with std/resilience's split is_open/report pair.
 import std/time;
 import std/resilience;
 import net/metrics;
@@ -104,12 +104,6 @@ fn take_token(b: Bucket, rate: int) -> bool {
     true
 }
 
-// The same transitions resilience.guard applies, driven by Report messages.
-// Delegates to std/resilience's admit/report pair (M129) instead of duplicating them.
-fn report_to_breaker(b: resilience.Breaker, ok: bool) {
-    resilience.report(b, ok);
-}
-
 fn actor_loop(ch: Channel<Ctl>, cfg: Config) {
     var states: [RouteState] = [];
     for r in cfg.routes {
@@ -122,11 +116,10 @@ fn actor_loop(ch: Channel<Ctl>, cfg: Config) {
         );
     }
     let reg = new_registry();
-    var running = true;
-    while (running) {
+    while (true) {
         match (recv(ch)) {
             Option.None => {
-                running = false;
+                break;
             },
             Option.Some(msg) => {
                 match (msg) {
@@ -147,7 +140,7 @@ fn actor_loop(ch: Channel<Ctl>, cfg: Config) {
                     Ctl.Report(idx, ok, latency_ms) => {
                         let st = states[idx];
                         let labels = metrics.labels1("route", st.route.name);
-                        report_to_breaker(st.breaker, ok);
+                        resilience.report(st.breaker, ok);
                         if (!ok) {
                             metrics.inc(reg, "raygate_upstream_errors_total", labels);
                         }

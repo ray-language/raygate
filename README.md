@@ -16,9 +16,10 @@ $ raygate --config raygate.toml
 
 ## Configuración
 
-Las rutas son tablas con nombre (`[route.api]`) — `std/toml` aún no soporta
-arrays de tablas `[[route]]` (hallazgo anotado); el nombre es la etiqueta de
-métricas. Prefijo más largo gana.
+Las rutas son tablas con nombre (`[route.api]`) o un array de tablas
+`[[route]]` con una clave `name` opcional (si falta, `route<N>`); las dos formas
+se pueden mezclar. El nombre es la etiqueta de métricas y no puede repetirse.
+Prefijo más largo gana.
 
 ```toml
 [server]
@@ -37,7 +38,7 @@ retries = 2                # solo métodos idempotentes (GET/HEAD/OPTIONS)
 breaker_threshold = 5      # fallos seguidos que abren el circuito
 breaker_cooldown_ms = 10000
 rate_limit = 50            # req/s por ruta (token bucket); 0 = sin límite
-jwt_secret = ""            # no vacío = exige Bearer HS256 (y valida exp)
+jwt_secret = ""            # no vacío = exige Bearer HS256 (y valida exp/nbf)
 stream = false             # true = respuesta en streaming (sin reintentos)
 add_request_headers = ["X-Gateway: raygate"]
 ```
@@ -47,8 +48,8 @@ add_request_headers = ["X-Gateway: raygate"]
 1. Ruta por prefijo más largo; `/metrics` y `/health` los sirve el propio gateway.
 2. **Admisión** en el actor de control: breaker abierto → 503 al instante;
    token bucket agotado → 429.
-3. **JWT** si la ruta lo exige: firma HS256 (`net/jwt`) + expiración (`exp`) →
-   401 con `WWW-Authenticate`.
+3. **JWT** si la ruta lo exige: firma HS256 + expiración (`exp`) y validez
+   (`nbf`) con `jwt_verify_claims` de `net/jwt` → 401 con `WWW-Authenticate`.
 4. **Upstream**: cabeceras reenviadas menos hop-by-hop (RFC 9110 §7.6.1),
    extras de la ruta añadidas, `traceparent` HIJO propagado (W3C).
    - *Buffered*: reintentos con backoff+jitter (`resilience.retry`) bajo un
@@ -78,14 +79,14 @@ req/s en nativo** (generador de carga co-alojado y en VM: cota inferior).
 | Rate limit por ruta (token bucket) → 429 | ✅ |
 | Circuit breaker por ruta (`std/resilience`) → 503 fail-fast | ✅ |
 | Reintentos idempotentes con backoff bajo deadline único | ✅ |
-| JWT HS256 + expiración → 401 | ✅ |
+| JWT HS256 + `exp`/`nbf` → 401 | ✅ |
 | Proxy streaming con contrapresión (canal acotado) | ✅ |
 | Higiene de cabeceras hop-by-hop + extras por ruta | ✅ |
 | `traceparent` W3C propagado + logs JSON con `trace_id` | ✅ |
 | Métricas Prometheus (`/metrics`): contadores + histograma | ✅ |
 | Apagado graceful (`serve_graceful`, SIGTERM/SIGINT + drenado) | ✅ |
 | Binario nativo (E2E y streaming verificados) | ✅ |
-| Tests (config + E2E completo con upstreams reales) | ✅ 4 |
+| Tests (config + E2E completo con upstreams reales) | ✅ 11 |
 | Rate limit por IP de cliente / X-Forwarded-For | ✅ (raylang M123: `Request.remote`) |
 | Passthrough WebSocket/SSE de larga vida, TLS de entrada | 📋 v2 |
 
@@ -96,18 +97,17 @@ Anotados en `raylang/IDEAS.md` §65:
 1. **[RESUELTO — raylang M123]** `webserver.Request` no expone la dirección
    del cliente: `Request.remote`/`remote_ip(req)` existen y el gateway hace
    rate limit POR IP (un bucket por cliente) y anexa `X-Forwarded-For`.
-2. **`ray test` deja listeners medio muertos entre tests**: las fibras de un
-   `@test` anterior se descartan pero sus sockets de escucha del SO sobreviven
-   (aceptan y nadie atiende) → un boot compartido entre tests se envenena; el
-   E2E vive en UN solo `@test`. Sin `var` top-level tampoco hay "boot once".
-3. **`std/toml` sin arrays de tablas `[[route]]`** (diferido documentado, aquí
-   confirmado como necesidad real: es LA forma natural de configurar un proxy).
-4. **`resilience.guard` no sirve cuando la llamada protegida no puede correr
-   en la fibra dueña del estado** (el gateway reimplementa sus transiciones
-   sobre los campos del `Breaker` — que además expone `abierto_hasta` en
-   español). Un par `admit/report` de primera clase encajaría mejor.
-5. `jwt_verify` valida solo la firma (documentado): cada gateway reescribe la
-   política de `exp` — candidato a un helper con claims.
+2. **[RESUELTO — raylang M129]** `ray test` dejaba listeners medio muertos
+   entre tests: ahora cierra todos los handles del SO que deja cada `@test`, y
+   el E2E se reparte en un `@test` por escenario, cada uno con su propio boot.
+3. **[RESUELTO — raylang M128]** `std/toml` sin arrays de tablas `[[route]]`:
+   ya los soporta (aplanados como `route.N.clave` + `toml_array_len`) y el
+   gateway acepta las dos formas.
+4. **[RESUELTO — raylang M129]** `resilience.guard` no servía cuando la
+   llamada protegida no puede correr en la fibra dueña del estado: el actor usa
+   el par `is_open`/`report` de `std/resilience`.
+5. **[RESUELTO — net M128]** `jwt_verify` validaba solo la firma:
+   `jwt_verify_claims` comprueba también `exp`/`nbf` y el gateway la usa.
 6. **Positivo y citable**: la nota "VM only" de `webserver.serve` está
    desactualizada — el gateway completo (accept, fibras, streaming chunked,
    señales) funciona compilado a nativo; `stream_response` + `http.stream_with`
@@ -116,7 +116,7 @@ Anotados en `raylang/IDEAS.md` §65:
 ## Desarrollo
 
 ```sh
-ray test                          # 4 tests (config + E2E con upstreams reales)
+ray test                          # 11 tests (config + E2E con upstreams reales)
 ray run src/main.ray check
 ray run src/main.ray --config raygate.toml
 ray build --native src/main.ray -o raygate --release
