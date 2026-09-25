@@ -42,7 +42,19 @@ fn describe(cfg: config.Config) {
             extras = extras + " +stream";
         }
         print(
-            "  " + r.prefix + " -> " + r.upstream + " (timeout " + to_string(r.timeout_ms) + " ms, breaker " + to_string(r.breaker_threshold) + "/" + to_string(r.breaker_cooldown_ms) + " ms" + extras + ")"
+            "  "
+                + r.prefix
+                + " -> "
+                + r.upstream
+                + " (timeout "
+                + to_string(r.timeout_ms)
+                + " ms, breaker "
+                + to_string(r.breaker_threshold)
+                + "/"
+                + to_string(r.breaker_cooldown_ms)
+                + " ms"
+                + extras
+                + ")"
         );
     }
 }

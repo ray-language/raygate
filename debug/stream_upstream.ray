@@ -18,6 +18,9 @@ fn handler(req: webserver.Request) -> webserver.Response {
 fn main() -> int {
     match (webserver.serve("127.0.0.1", 18931, handler)) {
         Result.Ok(n) => 0,
-        Result.Err(e) => { eprint(e); 1 },
+        Result.Err(e) => {
+            eprint(e);
+            1
+        },
     }
 }
