@@ -2,12 +2,11 @@
 // retry + deadline, and streaming mode (upstream body relayed chunk by chunk
 // to the client with backpressure).
 import std/time;
-import std/json;
 import std/resilience;
 import net/http;
 import net/webserver;
 import net/trace;
-from net/jwt import jwt_verify;
+from net/jwt import jwt_verify_claims;
 from config import Route;
 
 // Hop-by-hop headers never cross a proxy (RFC 9110 §7.6.1); host and
@@ -119,8 +118,8 @@ fn bearer_token(req: webserver.Request) -> Option<string> {
     Option.None
 }
 
-// jwt_verify checks the HS256 signature only; exp is application policy, so
-// the gateway enforces it here (a token without exp is accepted).
+// The HS256 signature plus the time claims: an expired token (`exp`) and one not
+// yet valid (`nbf`) are rejected; a token without them is accepted.
 pub fn check_jwt(req: webserver.Request, secret: string) -> Result<int, string> {
     let token = match (bearer_token(req)) {
         Option.Some(t) => t,
@@ -128,22 +127,7 @@ pub fn check_jwt(req: webserver.Request, secret: string) -> Result<int, string> 
             return Result.Err("missing bearer token");
         },
     };
-    let payload = jwt_verify(secret.to_bytes(), token)?;
-    match (json.parse(payload)) {
-        Result.Ok(j) => {
-            match (json.get_int(j, "exp")) {
-                Option.Some(exp) => {
-                    if (exp * 1000 < time.now()) {
-                        return Result.Err("token expired");
-                    }
-                },
-                Option.None => { },
-            }
-        },
-        Result.Err(e) => {
-            return Result.Err("unreadable payload");
-        },
-    }
+    jwt_verify_claims(secret.to_bytes(), token, time.now())?;
     Result.Ok(0)
 }
 
@@ -205,21 +189,13 @@ pub fn streaming(req: webserver.Request, route: Route, t: trace.Trace) -> ProxyO
         Result.Ok(s) => {
             let ch: Channel<bytes> = Channel.bounded(8);
             spawn(fn() {
-                var pumping = true;
-                while (pumping) {
+                while (true) {
                     match (http.stream_read(s)) {
-                        Result.Ok(chunk_opt) => {
-                            match (chunk_opt) {
-                                Option.Some(chunk) => {
-                                    send(ch, chunk);
-                                },
-                                Option.None => {
-                                    pumping = false;
-                                },
-                            }
+                        Result.Ok(Option.Some(chunk)) => {
+                            send(ch, chunk);
                         },
-                        Result.Err(e) => {
-                            pumping = false;
+                        _ => {
+                            break;
                         },
                     }
                 }

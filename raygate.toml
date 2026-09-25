@@ -1,7 +1,7 @@
 # raygate example configuration.
 #
-# Routes are NAMED tables ([route.<name>]) because std/toml does not support
-# arrays of tables ([[route]]) yet; the name doubles as the metrics label.
+# Routes are NAMED tables ([route.<name>]) or an array of tables ([[route]] with
+# an optional `name` key); the name doubles as the metrics label.
 
 [server]
 bind = "127.0.0.1"
