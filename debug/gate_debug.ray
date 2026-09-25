@@ -20,10 +20,15 @@ strip_prefix = true
 `;
 
 fn main() -> int {
-    spawn(fn() { webserver.serve("127.0.0.1", 18911, upstream_handler); });
+    spawn(fn() {
+        webserver.serve("127.0.0.1", 18911, upstream_handler);
+    });
     let cfg = match (config.parse_config(CFG)) {
         Result.Ok(c) => c,
-        Result.Err(e) => { eprint(e); return 1; },
+        Result.Err(e) => {
+            eprint(e);
+            return 1;
+        },
     };
     let g = gateway.make(cfg);
     spawn(fn() {
@@ -36,8 +41,24 @@ fn main() -> int {
     while (i < 3) {
         let t0 = time.monotonic();
         match (http.request_bytes("GET", "http://127.0.0.1:18913/api/x", b"", Map.new(), 3000)) {
-            Result.Ok(r) => print("req " + to_string(i) + ": " + to_string(r.status) + " in " + to_string(time.monotonic() - t0) + " ms"),
-            Result.Err(e) => print("req " + to_string(i) + ": ERR " + e + " in " + to_string(time.monotonic() - t0) + " ms"),
+            Result.Ok(r) => print(
+                "req "
+                    + to_string(i)
+                    + ": "
+                    + to_string(r.status)
+                    + " in "
+                    + to_string(time.monotonic() - t0)
+                    + " ms"
+            ),
+            Result.Err(e) => print(
+                "req "
+                    + to_string(i)
+                    + ": ERR "
+                    + e
+                    + " in "
+                    + to_string(time.monotonic() - t0)
+                    + " ms"
+            ),
         }
         i = i + 1;
     }

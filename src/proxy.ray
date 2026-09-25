@@ -15,7 +15,17 @@ from config import Route;
 // http client negotiates its own (it un-gzips transparently in buffered mode).
 fn hop_by_hop(name: string) -> bool {
     let n = name.to_lower();
-    n == "connection" || n == "keep-alive" || n == "proxy-authenticate" || n == "proxy-authorization" || n == "te" || n == "trailer" || n == "transfer-encoding" || n == "upgrade" || n == "host" || n == "content-length" || n == "accept-encoding"
+    n == "connection"
+        || n == "keep-alive"
+        || n == "proxy-authenticate"
+        || n == "proxy-authorization"
+        || n == "te"
+        || n == "trailer"
+        || n == "transfer-encoding"
+        || n == "upgrade"
+        || n == "host"
+        || n == "content-length"
+        || n == "accept-encoding"
 }
 
 pub fn upstream_url(route: Route, path: string, query: string) -> string {
@@ -155,9 +165,11 @@ pub fn buffered(req: webserver.Request, route: Route, t: trace.Trace) -> ProxyOu
     let url = upstream_url(route, req.path, req.query);
     let headers = forward_headers(req, route, t);
     let d = resilience.deadline(route.timeout_ms);
-    let attempts = if (route.retries > 0 && idempotent(
-        req.method
-    )) { route.retries + 1 } else { 1 };
+    let attempts = if (route.retries > 0 && idempotent(req.method)) {
+        route.retries + 1
+    } else {
+        1
+    };
     let p = resilience.policy(attempts, 100, 1000);
     let method = req.method;
     let body = req.body;

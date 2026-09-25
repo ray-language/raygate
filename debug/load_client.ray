@@ -8,7 +8,9 @@ fn worker(done: Channel<int>) {
     while (i < 50) {
         match (http.request_bytes("GET", "http://127.0.0.1:18922/api/x", b"", Map.new(), 10000)) {
             Result.Ok(r) => {
-                if (r.status == 200) { ok = ok + 1; }
+                if (r.status == 200) {
+                    ok = ok + 1;
+                }
             },
             Result.Err(e) => { },
         }
@@ -22,18 +24,33 @@ fn main() -> int {
     let t0 = time.monotonic();
     var w = 0;
     while (w < 20) {
-        spawn(fn() { worker(done); });
+        spawn(fn() {
+            worker(done);
+        });
         w = w + 1;
     }
     var total = 0;
     var got = 0;
     while (got < 20) {
         match (recv(done)) {
-            Option.Some(n) => { total = total + n; got = got + 1; },
-            Option.None => { got = 20; },
+            Option.Some(n) => {
+                total = total + n;
+                got = got + 1;
+            },
+            Option.None => {
+                got = 20;
+            },
         }
     }
     let ms = time.monotonic() - t0;
-    print("ok " + to_string(total) + "/1000 in " + to_string(ms) + " ms = " + to_string(1000 * 1000 / ms) + " req/s");
+    print(
+        "ok "
+            + to_string(total)
+            + "/1000 in "
+            + to_string(ms)
+            + " ms = "
+            + to_string(1000 * 1000 / ms)
+            + " req/s"
+    );
     0
 }
