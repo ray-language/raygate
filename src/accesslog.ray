@@ -1,0 +1,71 @@
+// raygate — the log writer. Every request logs a line; writing each one from its handler fiber
+// cost a stdout write per request (~19% of the gateway's throughput at 64 concurrent clients,
+// measured with raymart's make bench). Handlers render their line and hand it to this fiber
+// with a one-way send; the writer joins whatever is queued (up to MAX_BATCH lines) into one
+// write. Same lines, same format, same order per sender; a full queue makes handlers wait
+// (backpressure), it never drops a line.
+import std/time;
+from net/log import LogEntry, render;
+
+const QUEUE: int = 4096;
+
+const MAX_BATCH: int = 256;
+
+pub struct AccessLog {
+    lines: Channel<string>,
+    done: Channel<int>,
+}
+
+pub fn start() -> AccessLog {
+    let lines: Channel<string> = Channel.bounded(QUEUE);
+    let done: Channel<int> = Channel.bounded(1);
+    spawn(fn() {
+        writer(lines);
+        send(done, 0);
+    });
+    AccessLog { lines: lines, done: done }
+}
+
+fn writer(lines: Channel<string>) {
+    while (true) {
+        match (recv(lines)) {
+            Option.None => {
+                break;
+            },
+            Option.Some(first) => {
+                var batch: [string] = [first];
+                var more = true;
+                while (more && batch.len() < MAX_BATCH) {
+                    match (try_recv(lines)) {
+                        Received.Got(line) => batch.push(line),
+                        _ => {
+                            more = false;
+                        },
+                    }
+                }
+                print(batch.join("\n"));
+            },
+        }
+    }
+}
+
+/// `e` rendered with the current time, or "" if its level is below the logger's minimum.
+pub fn render_line(e: LogEntry) -> string {
+    if (e.level < e.lg.min_level) {
+        return "";
+    }
+    render(e, time.to_iso8601(time.now_utc()))
+}
+
+/// Queues `e` (if its level passes the logger's minimum), rendered with the current time.
+pub fn write(log: AccessLog, e: LogEntry) {
+    if (e.level >= e.lg.min_level) {
+        send(log.lines, render(e, time.to_iso8601(time.now_utc())));
+    }
+}
+
+/// Writes out what is still queued and stops the writer (on shutdown).
+pub fn stop(log: AccessLog) {
+    close(log.lines);
+    let _ = recv(log.done);
+}

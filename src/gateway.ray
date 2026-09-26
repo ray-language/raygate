@@ -4,6 +4,7 @@ import net/webserver;
 import config;
 import control;
 import proxy;
+import accesslog;
 from net/log import logger, with_trace, info, warn, field, field_int, emit;
 
 pub struct Gate {
@@ -11,6 +12,7 @@ pub struct Gate {
     ctl: Channel<control.Ctl>,
     // one keep-alive pool per route, same index as cfg.routes
     pools: [Channel<proxy.UpSlot>],
+    log: accesslog.AccessLog,
 }
 
 pub fn make(cfg: config.Config) -> Gate {
@@ -18,7 +20,7 @@ pub fn make(cfg: config.Config) -> Gate {
     for _ in cfg.routes {
         pools.push(proxy.upstream_pool(cfg.server.upstream_pool));
     }
-    Gate { cfg: cfg, ctl: control.start(cfg), pools: pools }
+    Gate { cfg: cfg, ctl: control.start(cfg), pools: pools, log: accesslog.start() }
 }
 
 pub fn handle(g: Gate, req: webserver.Request) -> webserver.Response {
@@ -38,18 +40,21 @@ pub fn handle(g: Gate, req: webserver.Request) -> webserver.Response {
             let route = g.cfg.routes[idx];
             match (control.admit(g.ctl, idx, webserver.remote_ip(req))) {
                 control.Verdict.RateLimited => {
-                    emit(field(warn(lg, "rate limited"), "route", route.name));
+                    accesslog.write(g.log, field(warn(lg, "rate limited"), "route", route.name));
                     webserver.text(429, "rate limit exceeded\n")
                 },
                 control.Verdict.BreakerOpen => {
-                    emit(field(warn(lg, "breaker open"), "route", route.name));
+                    accesslog.write(g.log, field(warn(lg, "breaker open"), "route", route.name));
                     webserver.text(503, "upstream unavailable (circuit open)\n")
                 },
                 control.Verdict.Allowed => {
                     if (route.jwt_secret != "") {
                         match (proxy.check_jwt(req, route.jwt_secret)) {
                             Result.Err(e) => {
-                                emit(field(warn(lg, "auth rejected"), "reason", e));
+                                accesslog.write(
+                                    g.log,
+                                    field(warn(lg, "auth rejected"), "reason", e)
+                                );
                                 var resp = webserver.text(401, "unauthorized: " + e + "\n");
                                 resp.headers.insert("WWW-Authenticate", "Bearer");
                                 return resp;
@@ -64,22 +69,20 @@ pub fn handle(g: Gate, req: webserver.Request) -> webserver.Response {
                         proxy.buffered(req, route, t, g.pools[idx])
                     };
                     let latency = time.monotonic() - started;
-                    control.report(g.ctl, idx, out.ok, latency);
-                    emit(
+                    let entry = field_int(
                         field_int(
-                            field_int(
-                                field(
-                                    field(info(lg, "proxied"), "route", route.name),
-                                    "method",
-                                    req.method
-                                ),
-                                "status",
-                                out.response.status
+                            field(
+                                field(info(lg, "proxied"), "route", route.name),
+                                "method",
+                                req.method
                             ),
-                            "ms",
-                            latency
-                        )
+                            "status",
+                            out.response.status
+                        ),
+                        "ms",
+                        latency
                     );
+                    control.report(g.ctl, idx, out.ok, latency, accesslog.render_line(entry));
                     out.response
                 },
             }
@@ -92,7 +95,9 @@ pub fn run(cfg: config.Config) -> Result<int, string> {
     let g = make(cfg);
     let lg = logger("raygate");
     emit(field_int(info(lg, "gateway listening"), "port", cfg.server.port));
-    webserver.serve_graceful(cfg.server.bind, cfg.server.port, cfg.server.drain_ms, fn(req: webserver.Request) -> webserver.Response {
+    let r = webserver.serve_graceful(cfg.server.bind, cfg.server.port, cfg.server.drain_ms, fn(req: webserver.Request) -> webserver.Response {
         handle(g, req)
-    })
+    });
+    accesslog.stop(g.log);
+    r
 }
