@@ -20,7 +20,8 @@ pub fn make(cfg: config.Config) -> Gate {
     for _ in cfg.routes {
         pools.push(proxy.upstream_pool(cfg.server.upstream_pool));
     }
-    Gate { cfg: cfg, ctl: control.start(cfg), pools: pools, log: accesslog.start() }
+    let log = accesslog.start();
+    Gate { cfg: cfg, ctl: control.start(cfg, log.lines), pools: pools, log: log }
 }
 
 pub fn handle(g: Gate, req: webserver.Request) -> webserver.Response {

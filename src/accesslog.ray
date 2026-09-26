@@ -1,15 +1,16 @@
-// raygate — the log writer. Every request logs a line; writing each one from its handler fiber
-// cost a stdout write per request (~19% of the gateway's throughput at 64 concurrent clients,
-// measured with raymart's make bench). Handlers render their line and hand it to this fiber
-// with a one-way send; the writer joins whatever is queued (up to MAX_BATCH lines) into one
-// write. Same lines, same format, same order per sender; a full queue makes handlers wait
-// (backpressure), it never drops a line.
+// raygate — the log writer: the one fiber that writes to stdout. Writing a line from each
+// handler cost a stdout write per request (~19% of the gateway's throughput at 64 concurrent
+// clients, measured with raymart's make bench). The per-request lines travel in the control
+// actor's Report message and reach this fiber as batches; the rare warnings come straight from
+// handlers. The writer joins whatever is queued (up to MAX_BATCH items) into one write. Same
+// lines, same format, same order per sender; a full queue makes senders wait (backpressure),
+// it never drops a line.
 import std/time;
 from net/log import LogEntry, render;
 
 const QUEUE: int = 4096;
 
-const MAX_BATCH: int = 256;
+const MAX_BATCH: int = 64;
 
 pub struct AccessLog {
     lines: Channel<string>,
