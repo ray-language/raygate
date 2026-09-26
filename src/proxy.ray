@@ -230,7 +230,8 @@ pub fn buffered(
     let p = resilience.policy(attempts, 100, 1000);
     let method = req.method;
     let body = req.body;
-    let result = resilience.retry(p, fn() -> Result<http.Response, string> {
+    // Annotated: raylang 1.27.14 cannot build this natively otherwise (RAYLANG-FINDINGS #92).
+    let result: Result<http.Response, string> = resilience.retry(p, fn() -> Result<http.Response, string> {
         let left = resilience.remaining(d);
         if (left <= 0) {
             return Result.Err("deadline exceeded");
