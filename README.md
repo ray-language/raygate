@@ -26,6 +26,7 @@ Prefijo más largo gana.
 bind = "0.0.0.0"
 port = 8080
 drain_ms = 3000            # drenado del apagado graceful (SIGTERM/SIGINT)
+upstream_pool = 64         # conexiones keep-alive por ruta hacia su upstream (modo buffered)
 metrics_path = "/metrics"  # "" lo desactiva
 health_path = "/health"
 
