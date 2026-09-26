@@ -38,10 +38,13 @@ struct RouteState {
     buckets: Map<string, Bucket>,
 }
 
-pub fn start(cfg: Config) -> Channel<Ctl> {
+/// Starts the actor. Access-log lines reported to it are handed, a batch at a time, to `log`
+/// (the writer fiber of accesslog.ray): the actor never waits on stdout itself, so a slow log
+/// consumer cannot stall admission.
+pub fn start(cfg: Config, log: Channel<string>) -> Channel<Ctl> {
     let ch: Channel<Ctl> = Channel.bounded(256);
     spawn(fn() {
-        actor_loop(ch, cfg);
+        actor_loop(ch, cfg, log);
     });
     ch
 }
@@ -106,7 +109,7 @@ fn take_token(b: Bucket, rate: int) -> bool {
     true
 }
 
-fn actor_loop(ch: Channel<Ctl>, cfg: Config) {
+fn actor_loop(ch: Channel<Ctl>, cfg: Config, log: Channel<string>) {
     var states: [RouteState] = [];
     for r in cfg.routes {
         states.push(
@@ -121,8 +124,8 @@ fn actor_loop(ch: Channel<Ctl>, cfg: Config) {
     var lines: [string] = [];
     while (true) {
         // Handle one message (waiting for it), then whatever else is already queued (up to 256),
-        // then write the batch of log lines: under load they go out in large writes, and at low
-        // traffic each line is written as soon as its request is reported.
+        // then pass the batch of log lines on: under load they go out in large writes, and at
+        // low traffic each line is written as soon as its request is reported.
         match (recv(ch)) {
             Option.None => {
                 break;
@@ -143,7 +146,7 @@ fn actor_loop(ch: Channel<Ctl>, cfg: Config) {
                     }
                 }
                 if (lines.len() > 0) {
-                    print(lines.join("\n"));
+                    send(log, lines.join("\n"));
                     lines = [];
                 }
             },
