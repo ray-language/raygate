@@ -32,7 +32,19 @@ fn upstream_handler(req: webserver.Request) -> webserver.Response {
             }
         },
     };
-    var resp = webserver.text(200, "path=" + req.path + " trace=" + tp + " gw=" + gw);
+    var resp = webserver.text(
+        200,
+        "path="
+            + req.path
+            + " query="
+            + req.query
+            + " trace="
+            + tp
+            + " gw="
+            + gw
+            + " from="
+            + req.remote
+    );
     resp.headers.insert("X-Upstream", "echo");
     resp
 }
@@ -56,6 +68,7 @@ const GATE_CFG: string = `
 bind = "127.0.0.1"
 port = 18903
 metrics_path = "/metrics"
+upstream_pool = 2
 
 [route.api]
 prefix = "/api/"
@@ -126,6 +139,7 @@ fn scenario_proxy_basics() {
     assert_eq(r.status, 200);
     let body = body_of(r);
     assert(body.contains("path=/users"));
+    assert(body.contains("query=id=7"));
     assert(body.contains("trace=00-"));
     match (http.header(r, "x-upstream")) {
         Option.Some(v) => assert_eq(v, "echo"),
@@ -135,6 +149,21 @@ fn scenario_proxy_basics() {
         Option.Some(v) => assert_eq(v, "raygate"),
         Option.None => panic("missing X-Gateway"),
     }
+}
+
+// Sequential requests reuse the pool's keep-alive connections: 20 requests reach the upstream
+// from at most `upstream_pool` client ports, not 20.
+fn scenario_upstream_keep_alive() {
+    var peers: [string] = [];
+    for _ in 0..20 {
+        let body = body_of(fetch_gate("/api/whoami"));
+        let from = body.split(" from=")[1];
+        if (!peers.contains(from)) {
+            peers.push(from);
+        }
+    }
+    // The pool (upstream_pool = 2) dials each of its slots once, then reuses them.
+    assert(peers.len() <= 2);
 }
 
 fn scenario_404() {
@@ -224,6 +253,12 @@ fn scenario_streaming() {
 fn proxies_with_trace_and_gateway_headers() {
     boot();
     scenario_proxy_basics();
+}
+
+@test
+fn reuses_upstream_connections() {
+    boot();
+    scenario_upstream_keep_alive();
 }
 
 @test

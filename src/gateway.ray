@@ -9,10 +9,16 @@ from net/log import logger, with_trace, info, warn, field, field_int, emit;
 pub struct Gate {
     cfg: config.Config,
     ctl: Channel<control.Ctl>,
+    // one keep-alive pool per route, same index as cfg.routes
+    pools: [Channel<proxy.UpSlot>],
 }
 
 pub fn make(cfg: config.Config) -> Gate {
-    Gate { cfg: cfg, ctl: control.start(cfg) }
+    var pools: [Channel<proxy.UpSlot>] = [];
+    for _ in cfg.routes {
+        pools.push(proxy.upstream_pool(cfg.server.upstream_pool));
+    }
+    Gate { cfg: cfg, ctl: control.start(cfg), pools: pools }
 }
 
 pub fn handle(g: Gate, req: webserver.Request) -> webserver.Response {
@@ -55,7 +61,7 @@ pub fn handle(g: Gate, req: webserver.Request) -> webserver.Response {
                     let out = if (route.stream) {
                         proxy.streaming(req, route, t)
                     } else {
-                        proxy.buffered(req, route, t)
+                        proxy.buffered(req, route, t, g.pools[idx])
                     };
                     let latency = time.monotonic() - started;
                     control.report(g.ctl, idx, out.ok, latency);

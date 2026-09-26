@@ -13,6 +13,8 @@ pub struct ServerCfg {
     drain_ms: int,
     metrics_path: string,
     health_path: string,
+    // keep-alive connections kept per route to its upstream (buffered mode)
+    upstream_pool: int,
 }
 
 pub struct Route {
@@ -170,7 +172,8 @@ pub fn parse_config(src: string) -> Result<Config, string> {
         port: get_int(entries, "server.port", 8080),
         drain_ms: get_int(entries, "server.drain_ms", 3000),
         metrics_path: get_str(entries, "server.metrics_path", "/metrics"),
-        health_path: get_str(entries, "server.health_path", "/health")
+        health_path: get_str(entries, "server.health_path", "/health"),
+        upstream_pool: get_int(entries, "server.upstream_pool", 64)
     };
     let array_len = toml.toml_array_len(entries, "route");
     var routes: [Route] = [];
