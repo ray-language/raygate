@@ -18,7 +18,9 @@ pub enum Verdict {
 
 pub enum Ctl {
     Admit(int, string, Channel<Verdict>),
-    Report(int, bool, int),
+    // route index, ok, latency ms, and the request's access-log line ("" = none): the actor
+    // writes the lines, batched, so a request wakes one fiber fewer than with its own writer
+    Report(int, bool, int, string),
     Scrape(Channel<string>),
 }
 
@@ -116,42 +118,70 @@ fn actor_loop(ch: Channel<Ctl>, cfg: Config) {
         );
     }
     let reg = new_registry();
+    var lines: [string] = [];
     while (true) {
+        // Handle one message (waiting for it), then whatever else is already queued (up to 256),
+        // then write the batch of log lines: under load they go out in large writes, and at low
+        // traffic each line is written as soon as its request is reported.
         match (recv(ch)) {
             Option.None => {
                 break;
             },
-            Option.Some(msg) => {
-                match (msg) {
-                    Ctl.Admit(idx, ip, reply) => {
-                        let st = states[idx];
-                        let labels = metrics.labels1("route", st.route.name);
-                        if (resilience.is_open(st.breaker)) {
-                            metrics.inc(reg, "raygate_breaker_fastfail_total", labels);
-                            send(reply, Verdict.BreakerOpen);
-                        } else if (!take_token(bucket_for(st, ip), st.route.rate_limit)) {
-                            metrics.inc(reg, "raygate_rate_limited_total", labels);
-                            send(reply, Verdict.RateLimited);
-                        } else {
-                            metrics.inc(reg, "raygate_requests_total", labels);
-                            send(reply, Verdict.Allowed);
-                        }
-                    },
-                    Ctl.Report(idx, ok, latency_ms) => {
-                        let st = states[idx];
-                        let labels = metrics.labels1("route", st.route.name);
-                        resilience.report(st.breaker, ok);
-                        if (!ok) {
-                            metrics.inc(reg, "raygate_upstream_errors_total", labels);
-                        }
-                        metrics.observe_l(reg, "raygate_upstream_ms", labels, latency_ms as float);
-                    },
-                    Ctl.Scrape(reply) => {
-                        send(reply, metrics.render(reg));
-                    },
+            Option.Some(first) => {
+                handle_ctl(first, states, reg, lines);
+                var n = 1;
+                var more = true;
+                while (more && n < 256) {
+                    match (try_recv(ch)) {
+                        Received.Got(m) => {
+                            handle_ctl(m, states, reg, lines);
+                            n = n + 1;
+                        },
+                        _ => {
+                            more = false;
+                        },
+                    }
+                }
+                if (lines.len() > 0) {
+                    print(lines.join("\n"));
+                    lines = [];
                 }
             },
         }
+    }
+}
+
+fn handle_ctl(msg: Ctl, states: [RouteState], reg: metrics.Registry, lines: [string]) {
+    match (msg) {
+        Ctl.Admit(idx, ip, reply) => {
+            let st = states[idx];
+            let labels = metrics.labels1("route", st.route.name);
+            if (resilience.is_open(st.breaker)) {
+                metrics.inc(reg, "raygate_breaker_fastfail_total", labels);
+                send(reply, Verdict.BreakerOpen);
+            } else if (!take_token(bucket_for(st, ip), st.route.rate_limit)) {
+                metrics.inc(reg, "raygate_rate_limited_total", labels);
+                send(reply, Verdict.RateLimited);
+            } else {
+                metrics.inc(reg, "raygate_requests_total", labels);
+                send(reply, Verdict.Allowed);
+            }
+        },
+        Ctl.Report(idx, ok, latency_ms, line) => {
+            if (line != "") {
+                lines.push(line);
+            }
+            let st = states[idx];
+            let labels = metrics.labels1("route", st.route.name);
+            resilience.report(st.breaker, ok);
+            if (!ok) {
+                metrics.inc(reg, "raygate_upstream_errors_total", labels);
+            }
+            metrics.observe_l(reg, "raygate_upstream_ms", labels, latency_ms as float);
+        },
+        Ctl.Scrape(reply) => {
+            send(reply, metrics.render(reg));
+        },
     }
 }
 
@@ -165,8 +195,8 @@ pub fn admit(ctl: Channel<Ctl>, idx: int, ip: string) -> Verdict {
     }
 }
 
-pub fn report(ctl: Channel<Ctl>, idx: int, ok: bool, latency_ms: int) {
-    send(ctl, Ctl.Report(idx, ok, latency_ms));
+pub fn report(ctl: Channel<Ctl>, idx: int, ok: bool, latency_ms: int, line: string) {
+    send(ctl, Ctl.Report(idx, ok, latency_ms, line));
 }
 
 pub fn scrape(ctl: Channel<Ctl>) -> string {
