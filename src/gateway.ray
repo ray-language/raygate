@@ -1,6 +1,7 @@
 // raygate — wiring: the request handler and the graceful server.
 import std/time;
 import net/webserver;
+import net/http;
 import config;
 import control;
 import proxy;
@@ -11,14 +12,14 @@ pub struct Gate {
     cfg: config.Config,
     ctl: Channel<control.Ctl>,
     // one keep-alive pool per route, same index as cfg.routes
-    pools: [Channel<proxy.UpSlot>],
+    pools: [http.Pool],
     log: accesslog.AccessLog,
 }
 
 pub fn make(cfg: config.Config) -> Gate {
-    var pools: [Channel<proxy.UpSlot>] = [];
+    var pools: [http.Pool] = [];
     for _ in cfg.routes {
-        pools.push(proxy.upstream_pool(cfg.server.upstream_pool));
+        pools.push(http.pool(cfg.server.upstream_pool));
     }
     let log = accesslog.start();
     Gate { cfg: cfg, ctl: control.start(cfg, log.lines), pools: pools, log: log }

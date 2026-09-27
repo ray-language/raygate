@@ -133,70 +133,11 @@ pub fn check_jwt(req: webserver.Request, secret: string) -> Result<int, string> 
 
 // --- Upstream connections ---------------------------------------------------
 
-// Buffered requests go upstream over keep-alive connections from a per-route pool: a bounded
-// channel of slots, the shape of packages/rpc's pool. Fibers do not share heaps, but a socket
-// passed through a channel is the same socket in every fiber. A connection per request would
-// leave every closed socket in TIME_WAIT for 60 s, and at a few hundred requests per second
-// the gateway runs out of ephemeral ports.
-
-/// A pool slot: an idle keep-alive connection to the route's upstream, or one to dial.
-pub enum UpSlot {
-    Ready(http.Conn),
-    Empty,
-}
-
-/// A pool of up to `size` upstream connections, dialed on demand. The slots rotate FIFO, so the
-/// pool grows to `size` connections under steady traffic and then reuses them.
-pub fn upstream_pool(size: int) -> Channel<UpSlot> {
-    let n = if (size < 1) { 1 } else { size };
-    let slots: Channel<UpSlot> = Channel.bounded(n);
-    for _ in 0..n {
-        send(slots, UpSlot.Empty);
-    }
-    slots
-}
-
-/// The request target on the upstream: the (possibly stripped) path plus the query.
-pub fn upstream_target(route: Route, path: string, query: string) -> string {
-    let url = upstream_url(route, path, query);
-    url.substring(route.upstream.len(), url.len())
-}
-
-fn pooled_request(
-    pool: Channel<UpSlot>,
-    upstream: string,
-    method: string,
-    target: string,
-    body: bytes,
-    headers: Map<string, string>,
-    timeout_ms: int
-) -> Result<http.Response, string> {
-    let c = match (recv(pool)) {
-        Option.None => return Result.Err("the upstream pool is closed"),
-        Option.Some(slot) => match (slot) {
-            UpSlot.Ready(c) => c,
-            UpSlot.Empty => match (http.connect(upstream)) {
-                Result.Ok(c) => c,
-                Result.Err(e) => {
-                    send(pool, UpSlot.Empty);
-                    return Result.Err(e);
-                },
-            },
-        },
-    };
-    match (http.conn_request_bytes(c, method, target, body, headers, timeout_ms)) {
-        Result.Ok(r) => {
-            send(pool, UpSlot.Ready(c));
-            Result.Ok(r)
-        },
-        Result.Err(e) => {
-            // A failed exchange may leave the connection out of sync: close it, redial later.
-            http.conn_close(c);
-            send(pool, UpSlot.Empty);
-            Result.Err(e)
-        },
-    }
-}
+// Buffered requests go upstream over keep-alive connections from a per-route `http.Pool`
+// (net): a connection per request would leave every closed socket in TIME_WAIT for 60 s, and
+// at a few hundred requests per second the gateway runs out of ephemeral ports. The pool prefers
+// an idle connection, dials only when none is free, and redials (retrying once) a reused
+// connection the upstream closed while idle.
 
 // --- Buffered mode ----------------------------------------------------------
 
@@ -216,10 +157,9 @@ pub fn buffered(
     req: webserver.Request,
     route: Route,
     t: trace.Trace,
-    pool: Channel<UpSlot>
+    pool: http.Pool
 ) -> ProxyOutcome {
-    let target = upstream_target(route, req.path, req.query);
-    let upstream = route.upstream;
+    let url = upstream_url(route, req.path, req.query);
     let headers = forward_headers(req, route, t);
     let d = resilience.deadline(route.timeout_ms);
     let attempts = if (route.retries > 0 && idempotent(req.method)) {
@@ -235,7 +175,7 @@ pub fn buffered(
         if (left <= 0) {
             return Result.Err("deadline exceeded");
         }
-        pooled_request(pool, upstream, method, target, body, headers, left)
+        http.pool_request_bytes(pool, method, url, body, headers, left)
     });
     match (result) {
         Result.Ok(up) => {

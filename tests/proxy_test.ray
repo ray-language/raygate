@@ -151,8 +151,8 @@ fn scenario_proxy_basics() {
     }
 }
 
-// Sequential requests reuse the pool's keep-alive connections: 20 requests reach the upstream
-// from at most `upstream_pool` client ports, not 20.
+// Sequential requests reuse the pool's keep-alive connections: the pool hands out an idle
+// connection before dialing a new one, so 20 requests reach the upstream from one client port.
 fn scenario_upstream_keep_alive() {
     var peers: [string] = [];
     for _ in 0..20 {
@@ -162,8 +162,7 @@ fn scenario_upstream_keep_alive() {
             peers.push(from);
         }
     }
-    // The pool (upstream_pool = 2) dials each of its slots once, then reuses them.
-    assert(peers.len() <= 2);
+    assert_eq(peers.len(), 1);
 }
 
 fn scenario_404() {
