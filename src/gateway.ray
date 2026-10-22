@@ -6,6 +6,7 @@ import config;
 import control;
 import proxy;
 import accesslog;
+import pathsafe;
 from net/log import logger, with_trace, info, warn, field, field_int, emit;
 
 pub struct Gate {
@@ -26,6 +27,15 @@ pub fn make(cfg: config.Config) -> Gate {
 }
 
 pub fn handle(g: Gate, req: webserver.Request) -> webserver.Response {
+    // Route (and check JWTs) on the normalized path, and forward that one (see pathsafe.ray).
+    match (pathsafe.normalize(req.path)) {
+        Option.Some(p) => {
+            req.path = p;
+        },
+        Option.None => {
+            return webserver.text(400, "bad request path\n");
+        },
+    }
     let t = webserver.trace_of(req);
     let lg = with_trace(logger("raygate"), t.trace_id);
     if (req.path == g.cfg.server.metrics_path && g.cfg.server.metrics_path != "") {

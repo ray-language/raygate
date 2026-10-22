@@ -47,6 +47,9 @@ add_request_headers = ["X-Gateway: raygate"]
 ## Qué hace por petición
 
 1. Ruta por prefijo más largo; `/metrics` y `/health` los sirve el propio gateway.
+   El prefijo se compara con la ruta descodificada y **normalizada** (`/public/%2e%2e/admin/x`
+   es `/admin/x` y pasa por el JWT de `/admin/`; subir por encima de `/` es un 400), y esa misma
+   ruta es la que se reenvía, con todo lo que no es válido en una ruta como `%XX`.
 2. **Admisión** en el actor de control: breaker abierto → 503 al instante;
    token bucket agotado → 429.
 3. **JWT** si la ruta lo exige: firma HS256 + expiración (`exp`) y validez

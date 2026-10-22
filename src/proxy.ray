@@ -8,6 +8,7 @@ import net/webserver;
 import net/trace;
 from net/jwt import jwt_verify_claims;
 from config import Route;
+import pathsafe;
 
 // Hop-by-hop headers never cross a proxy (RFC 9110 §7.6.1); host and
 // content-length are re-derived per hop, and accept-encoding is dropped so the
@@ -35,7 +36,7 @@ pub fn upstream_url(route: Route, path: string, query: string) -> string {
             p = "/" + p;
         }
     }
-    var url = route.upstream + p;
+    var url = route.upstream + pathsafe.encode(p);
     if (query != "") {
         url = url + "?" + query;
     }
