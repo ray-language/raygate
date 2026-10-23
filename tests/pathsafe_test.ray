@@ -32,3 +32,11 @@ fn illegal_octets_are_percent_encoded() {
 fn a_legal_path_is_left_as_is() {
     assert_eq(pathsafe.encode("/v1/users/42;x=1/@me:a,b+c"), "/v1/users/42;x=1/@me:a,b+c");
 }
+
+@test
+fn paths_an_upstream_may_read_differently_are_refused() {
+    assert(pathsafe.normalize("/public/..;/admin").is_none());
+    assert(pathsafe.normalize("/public/.;x/a").is_none());
+    assert(pathsafe.normalize("/public/..\\admin").is_none());
+    assert_eq(pathsafe.normalize("/a;v=1/b").unwrap_or(""), "/a;v=1/b");
+}

@@ -9,9 +9,12 @@
 
 /// The path with dot segments resolved (RFC 3986 §5.2.4), or None when it
 /// does not start with "/" or ".." climbs above the root. A trailing slash
-/// (or a trailing dot segment) is kept as a trailing slash.
+/// (or a trailing dot segment) is kept as a trailing slash. Paths an upstream
+/// may read differently are None too: a backslash (a separator on some
+/// servers) or a dot segment with ";" parameters ("..;", which Tomcat-style
+/// servers resolve as "..").
 pub fn normalize(path: string) -> Option<string> {
-    if (!path.starts_with("/")) {
+    if (!path.starts_with("/") || path.contains("\\")) {
         return Option.None;
     }
     let segs = path.substring(1, path.len()).split("/");
@@ -20,6 +23,10 @@ pub fn normalize(path: string) -> Option<string> {
     while (i < segs.len()) {
         let s = segs[i];
         let last = i == segs.len() - 1;
+        let bare = s.split(";")[0];
+        if (bare != s && (bare == "." || bare == "..")) {
+            return Option.None;
+        }
         if (s == "..") {
             if (out.len() == 0) {
                 return Option.None;
