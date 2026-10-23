@@ -1,0 +1,93 @@
+// The request path a proxy forwards. net hands the handler the path already
+// percent-decoded (req.path), so before routing and forwarding it:
+//   - normalize: "." and ".." segments are resolved on the decoded path, so
+//     "/a/%2e%2e/b" routes (and reaches the upstream) as "/b", and a path
+//     that climbs above the root is refused;
+//   - encode: every octet that is not legal in a path goes out as %XX, so a
+//     decoded CR/LF, space or '?' stays inside the path on the upstream
+//     request line.
+
+/// The path with dot segments resolved (RFC 3986 §5.2.4), or None when it
+/// does not start with "/" or ".." climbs above the root. A trailing slash
+/// (or a trailing dot segment) is kept as a trailing slash.
+pub fn normalize(path: string) -> Option<string> {
+    if (!path.starts_with("/")) {
+        return Option.None;
+    }
+    let segs = path.substring(1, path.len()).split("/");
+    var out: [string] = [];
+    var i = 0;
+    while (i < segs.len()) {
+        let s = segs[i];
+        let last = i == segs.len() - 1;
+        if (s == "..") {
+            if (out.len() == 0) {
+                return Option.None;
+            }
+            out.pop();
+            if (last) {
+                out.push("");
+            }
+        } else if (s == ".") {
+            if (last) {
+                out.push("");
+            }
+        } else {
+            out.push(s);
+        }
+        i = i + 1;
+    }
+    Option.Some("/" + join(out, "/"))
+}
+
+const HEX: string = "0123456789ABCDEF";
+
+// RFC 3986 pchar plus "/": unreserved, sub-delims, ':' and '@'.
+fn path_safe(c: int) -> bool {
+    c >= 97 && c <= 122
+        || c >= 65 && c <= 90
+        || c >= 48 && c <= 57
+        || c == 45
+        || c == 46
+        || c == 95
+        || c == 126
+        || c == 33
+        || c == 36
+        || c == 38
+        || c == 39
+        || c == 40
+        || c == 41
+        || c == 42
+        || c == 43
+        || c == 44
+        || c == 59
+        || c == 61
+        || c == 58
+        || c == 64
+        || c == 47
+}
+
+/// The decoded path re-encoded for a request line: legal octets as they
+/// are, every other octet (including '%' itself) as %XX.
+pub fn encode(path: string) -> string {
+    let b = path.to_bytes();
+    var clean = true;
+    for c in b {
+        if (!path_safe(c)) {
+            clean = false;
+            break;
+        }
+    }
+    if (clean) {
+        return path;
+    }
+    var out: [string] = [];
+    for c in b {
+        if (path_safe(c)) {
+            out.push(from_utf8(bytes_of([c])).unwrap_or(""));
+        } else {
+            out.push("%" + HEX.substring(c / 16, c / 16 + 1) + HEX.substring(c % 16, c % 16 + 1));
+        }
+    }
+    join(out, "")
+}
