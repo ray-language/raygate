@@ -3,6 +3,6 @@
 
 [net]
 url = "https://github.com/ray-language/net"
-ref = "v0.11.1"
-commit = "f289204a39be92019aa518f540ca388d105d498e"
-hash = "sha256:46d4a6d3fb22ade1c8b3843ac58b0a532cb6bcdfc79db9e3bdcfab9598a2bf2c"
+ref = "v0.11.2"
+commit = "b1366349b8caa837a2d6b6b1aaa16717a8a23f5a"
+hash = "sha256:550f5d7e276b90ec77d6697e722eca782482febc9608885dec00b95fefcb304f"
